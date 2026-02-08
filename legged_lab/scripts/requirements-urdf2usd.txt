@@ -1,0 +1,6 @@
+# URDF 转 USD 脚本依赖 (urdf_to_usd.py)
+# 安装: pip install -r requirements-urdf2usd.txt
+usd-core>=24.0
+urdfpy
+trimesh
+numpy

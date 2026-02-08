@@ -1,11 +1,14 @@
 import pickle
 import numpy as np
-import torch
 import argparse
-from isaaclab.utils.math import quat_mul, quat_conjugate, axis_angle_from_quat  
-from scipy.spatial.transform import Rotation 
+from scipy.spatial.transform import Rotation
 
-def convert_pkl_to_custom(input_pkl, output_txt, fps):
+# Roban S14 / biped_s14 的 23 关节中，移除手腕后的索引映射
+# 原始顺序含 left_wrist_joint(17)、right_wrist_joint(22)
+ROBAN_JOINT_INDICES_NO_WRIST = [i for i in range(23) if i not in (17, 22)]
+
+
+def convert_pkl_to_custom(input_pkl, output_txt, fps, remove_roban_wrist=False):
     dt = 1.0 / fps
 
     with open(input_pkl, "rb") as f:
@@ -15,13 +18,24 @@ def convert_pkl_to_custom(input_pkl, output_txt, fps):
     root_rot = motion_data["root_rot"][:, [3, 0, 1, 2]]  # xyzw → wxyz
     dof_pos = motion_data["dof_pos"]
 
-    root_lin_vel = (root_pos[1:] - root_pos[:-1]) / dt
-    root_rot_t = torch.tensor(root_rot, dtype=torch.float32)
+    if remove_roban_wrist:
+        if dof_pos.shape[1] != 23:
+            raise ValueError(
+                f"remove_roban_wrist 要求 dof_pos 为 23 列 (Roban S14)，当前为 {dof_pos.shape[1]} 列"
+            )
+        dof_pos = dof_pos[:, ROBAN_JOINT_INDICES_NO_WRIST]
+        print(f"  已移除 Roban 手腕关节 (索引 17, 22)，输出 21 关节")
 
-    q1_conj = quat_conjugate(root_rot_t[:-1])         
-    dq = quat_mul(q1_conj, root_rot_t[1:])            
-    axis_angle = axis_angle_from_quat(dq)             
-    root_ang_vel = axis_angle / dt
+    root_lin_vel = (root_pos[1:] - root_pos[:-1]) / dt
+
+    # 角速度：用 scipy 计算相邻帧四元数差对应的 axis-angle，不依赖 isaaclab
+    root_rot_xyzw = root_rot[:, [1, 2, 3, 0]]  # wxyz → xyzw for scipy
+    root_ang_vel = np.zeros((len(root_pos) - 1, 3))
+    for i in range(len(root_pos) - 1):
+        r1 = Rotation.from_quat(root_rot_xyzw[i])
+        r2 = Rotation.from_quat(root_rot_xyzw[i + 1])
+        dq_rot = r2 * r1.inv()
+        root_ang_vel[i] = dq_rot.as_rotvec() / dt
 
     dof_vel = (dof_pos[1:] - dof_pos[:-1]) / dt
 
@@ -62,8 +76,17 @@ def convert_pkl_to_custom(input_pkl, output_txt, fps):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input_pkl", type=str, required=True)
-    parser.add_argument("--output_txt", type=str, required=True)
+    parser.add_argument("--output_txt", type=str, default=None, help="Output .txt path (AMP format)")
+    parser.add_argument("--output_file", type=str, default=None, help="Alias for --output_txt")
     parser.add_argument("--fps", type=float, default=30.0)
+    parser.add_argument(
+        "--remove_roban_wrist",
+        action="store_true",
+        help="移除 Roban S14 的两个手腕关节 (索引 17, 22)，将 23 关节转为 21 关节",
+    )
     args = parser.parse_args()
 
-    convert_pkl_to_custom(args.input_pkl, args.output_txt, args.fps)
+    output_txt = args.output_txt or args.output_file
+    if not output_txt:
+        parser.error("必须指定 --output_txt 或 --output_file")
+    convert_pkl_to_custom(args.input_pkl, output_txt, args.fps, args.remove_roban_wrist)
