@@ -155,6 +155,65 @@ def joint_deviation_l1(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = S
     return torch.sum(torch.abs(angle), dim=1) * zero_flag
 
 
+def joint_pos_tracking_l2(
+    env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Track joint positions relative to default positions using L2 norm.
+    This reward encourages joints to stay close to their default/rest positions.
+    
+    Args:
+        env: The environment instance
+        asset_cfg: Scene entity configuration specifying which joints to track
+        
+    Returns:
+        L2 norm of joint position deviations (lower is better, so use negative weight)
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_pos_diff = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    return torch.sum(torch.square(joint_pos_diff), dim=1)
+
+
+def joint_pos_tracking_exp(
+    env: BaseEnv | TienKungEnv, std: float, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Track joint positions relative to default positions using exponential reward.
+    This reward gives higher values when joints are close to their default positions.
+    
+    Args:
+        env: The environment instance
+        std: Standard deviation for the exponential reward (controls sensitivity)
+        asset_cfg: Scene entity configuration specifying which joints to track
+        
+    Returns:
+        Exponential reward based on joint position deviations (higher is better)
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_pos_diff = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    error = torch.sum(torch.square(joint_pos_diff), dim=1)
+    return torch.exp(-error / std**2)
+
+
+def joint_vel_tracking_l2(
+    env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Track joint velocities relative to default velocities (usually zero).
+    This reward encourages smooth, controlled joint movements.
+    
+    Args:
+        env: The environment instance
+        asset_cfg: Scene entity configuration specifying which joints to track
+        
+    Returns:
+        L2 norm of joint velocity deviations (lower is better, so use negative weight)
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_vel_diff = asset.data.joint_vel[:, asset_cfg.joint_ids] - asset.data.default_joint_vel[:, asset_cfg.joint_ids]
+    return torch.sum(torch.square(joint_vel_diff), dim=1)
+
+
 def body_orientation_l2(
     env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:

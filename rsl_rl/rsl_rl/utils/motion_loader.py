@@ -24,10 +24,9 @@ import torch
 
 
 class AMPLoader:
-    JOINT_POS_SIZE = 20
-
-    JOINT_VEL_SIZE = 20
-
+    # Roban S14: 21 DoF (1 waist + 12 legs + 8 arms)
+    JOINT_POS_SIZE = 21
+    JOINT_VEL_SIZE = 21
     END_EFFECTOR_POS_SIZE = 12
 
     JOINT_POSE_START_IDX = 0

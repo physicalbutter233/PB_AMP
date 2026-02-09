@@ -31,6 +31,8 @@ class RolloutStorage:
             self.actions = None
             self.privileged_actions = None
             self.rewards = None
+            self.task_rewards = None  # Task rewards (for AMP reward combination)
+            self.amp_rewards = None   # AMP style rewards (for AMP reward combination)
             self.dones = None
             self.values = None
             self.actions_log_prob = None
@@ -72,6 +74,9 @@ class RolloutStorage:
         else:
             self.privileged_observations = None
         self.rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        # For AMP reward combination (matching amp_roban_share)
+        self.task_rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        self.amp_rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
@@ -110,6 +115,11 @@ class RolloutStorage:
             self.privileged_observations[self.step].copy_(transition.privileged_observations)
         self.actions[self.step].copy_(transition.actions)
         self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
+        # Store task and AMP rewards separately for combination during training
+        if transition.task_rewards is not None:
+            self.task_rewards[self.step].copy_(transition.task_rewards.view(-1, 1))
+        if transition.amp_rewards is not None:
+            self.amp_rewards[self.step].copy_(transition.amp_rewards.view(-1, 1))
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
 
         # for distillation

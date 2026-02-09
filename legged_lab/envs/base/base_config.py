@@ -66,6 +66,7 @@ class RobotCfg:
     action_scale: float = 0.25
     terminate_contacts_body_names: list = []
     feet_body_names: list = []
+    include_gait_in_obs: bool = True  # 是否在观察值中包含步态信息
 
 
 @configclass

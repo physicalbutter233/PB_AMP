@@ -57,13 +57,27 @@ class GaitCfg:
 
 @configclass
 class LiteRewardCfg:
-    track_lin_vel_xy_exp = RewTerm(func=mdp.track_lin_vel_xy_yaw_frame_exp, weight=1.0, params={"std": 0.5})
-    track_ang_vel_z_exp = RewTerm(func=mdp.track_ang_vel_z_world_exp, weight=1.0, params={"std": 0.5})
-    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-1.0)
-    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
-    energy = RewTerm(func=mdp.energy, weight=-1e-3)
-    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+    """简化的奖励配置，与kuavo对应"""
+    # 速度跟踪 (对应kuavo: tracking_lin_vel=1.2, tracking_ang_vel=1.1)
+    # 大幅增加权重以使 AMP 占比降至 4%（Task 占比 96%）
+    track_lin_vel_xy_exp = RewTerm(func=mdp.track_lin_vel_xy_yaw_frame_exp, weight=5.0, params={"std": 0.5})  # 2.5 → 10.0
+    track_ang_vel_z_exp = RewTerm(func=mdp.track_ang_vel_z_world_exp, weight=4.0, params={"std": 0.5})         # 2.0 → 8.0
+    
+    # 速度不匹配惩罚 (对应kuavo: vel_mismatch_exp=0.5)
+    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
+    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.5)
+    
+    # 姿态控制 (对应kuavo: orientation=1.0)
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-1.0)
+    
+    # 能量消耗 (对应kuavo: torques=-1e-5, dof_vel=-5e-4)
+    energy = RewTerm(func=mdp.energy, weight=-1e-5)
+    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-1e-7)
+    
+    # 动作平滑度 (对应kuavo: action_smoothness=-0.002)
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.002)
+    
+    # 碰撞惩罚 (对应kuavo: collision=-1.0)
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
         weight=-1.0,
@@ -74,89 +88,33 @@ class LiteRewardCfg:
             "threshold": 1.0,
         },
     )
-    body_orientation_l2 = RewTerm(
-        func=mdp.body_orientation_l2, params={"asset_cfg": SceneEntityCfg("robot", body_names="pelvis")}, weight=-2.0
-    )
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-1.0)
-    termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
+    
+    # 脚部滑动 (对应kuavo: foot_slip=-0.05)
     feet_slide = RewTerm(
         func=mdp.feet_slide,
-        weight=-0.25,
+        weight=-0.05,
         params={
             "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="ankle_roll.*"),
             "asset_cfg": SceneEntityCfg("robot", body_names="ankle_roll.*"),
         },
     )
+    
+    # 脚部接触力 (对应kuavo: feet_contact_forces=-0.01)
     feet_force = RewTerm(
         func=mdp.body_force,
-        weight=-3e-3,
+        weight=-0.01,
         params={
             "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="ankle_roll.*"),
             "threshold": 500,
             "max_reward": 400,
         },
     )
-    feet_too_near = RewTerm(
-        func=mdp.feet_too_near_humanoid,
-        weight=-2.0,
-        params={"asset_cfg": SceneEntityCfg("robot", body_names=["ankle_roll.*"]), "threshold": 0.2},
-    )
-    feet_stumble = RewTerm(
-        func=mdp.feet_stumble,
-        weight=-2.0,
-        params={"sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["ankle_roll.*"])},
-    )
-    dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-2.0)
-    joint_deviation_hip = RewTerm(
-        func=mdp.joint_deviation_l1,
-        weight=-0.15,
-        params={
-            "asset_cfg": SceneEntityCfg(
-                "robot",
-                joint_names=[
-                    "hip_yaw_.*_joint",
-                    "hip_roll_.*_joint",
-                    "shoulder_pitch_.*_joint",
-                    "elbow_pitch_.*_joint",
-                ],
-            )
-        },
-    )
-    joint_deviation_arms = RewTerm(
-        func=mdp.joint_deviation_l1,
-        weight=-0.2,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["shoulder_roll_.*_joint", "shoulder_yaw_.*_joint"])},
-    )
-    joint_deviation_legs = RewTerm(
-        func=mdp.joint_deviation_l1,
-        weight=-0.02,
-        params={
-            "asset_cfg": SceneEntityCfg(
-                "robot",
-                joint_names=[
-                    "hip_pitch_.*_joint",
-                    "knee_pitch_.*_joint",
-                    "ankle_pitch_.*_joint",
-                    "ankle_roll_.*_joint",
-                ],
-            )
-        },
-    )
-
-    gait_feet_frc_perio = RewTerm(func=mdp.gait_feet_frc_perio, weight=1.0, params={"delta_t": 0.02})
-    gait_feet_spd_perio = RewTerm(func=mdp.gait_feet_spd_perio, weight=1.0, params={"delta_t": 0.02})
-    gait_feet_frc_support_perio = RewTerm(func=mdp.gait_feet_frc_support_perio, weight=0.6, params={"delta_t": 0.02})
-
-    ankle_torque = RewTerm(func=mdp.ankle_torque, weight=-0.0005)
-    ankle_action = RewTerm(func=mdp.ankle_action, weight=-0.001)
-    hip_roll_action = RewTerm(func=mdp.hip_roll_action, weight=-1.0)
-    hip_yaw_action = RewTerm(func=mdp.hip_yaw_action, weight=-1.0)
-    feet_y_distance = RewTerm(func=mdp.feet_y_distance, weight=-2.0)
 
 
 @configclass
 class RobanLiteRewardCfg(LiteRewardCfg):
     """Reward 与 LiteRewardCfg 相同，但 body/joint 名称改为 Roban S14。"""
+    # 碰撞惩罚 - 使用Roban S14的body名称
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
         weight=-1.0,
@@ -168,66 +126,50 @@ class RobanLiteRewardCfg(LiteRewardCfg):
             "threshold": 1.0,
         },
     )
-    body_orientation_l2 = RewTerm(
-        func=mdp.body_orientation_l2,
-        params={"asset_cfg": SceneEntityCfg("robot", body_names="base_link")},
-        weight=-2.0,
-    )
+    
+    # 脚部滑动 - 使用Roban S14的body名称
     feet_slide = RewTerm(
         func=mdp.feet_slide,
-        weight=-0.25,
+        weight=-0.05,
         params={
             "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
             "asset_cfg": SceneEntityCfg("robot", body_names=["leg_l6_link", "leg_r6_link"]),
         },
     )
+    
+    # 脚部接触力 - 使用Roban S14的body名称
     feet_force = RewTerm(
         func=mdp.body_force,
-        weight=-3e-3,
+        weight=-0.01,
         params={
             "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
             "threshold": 500,
             "max_reward": 400,
         },
     )
-    feet_too_near = RewTerm(
-        func=mdp.feet_too_near_humanoid,
-        weight=-2.0,
-        params={"asset_cfg": SceneEntityCfg("robot", body_names=["leg_l6_link", "leg_r6_link"]), "threshold": 0.2},
-    )
-    feet_stumble = RewTerm(
-        func=mdp.feet_stumble,
-        weight=-2.0,
-        params={"sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"])},
-    )
-    joint_deviation_hip = RewTerm(
-        func=mdp.joint_deviation_l1,
-        weight=-0.15,
+    
+    ## 以下是为了防止诡异行走而设置
+    # 全身关节位置跟踪（指数形式）- 奖励关节接近默认位置
+    # 权重建议：0.1 到 1.0，std 控制敏感度（越小越严格）
+    joint_pos_tracking_exp_all = RewTerm(
+        func=mdp.joint_pos_tracking_exp,
+        weight=0.3,
         params={
-            "asset_cfg": SceneEntityCfg(
-                "robot",
-                joint_names=["leg_l3_joint", "leg_r3_joint", "zarm_l1_joint", "zarm_r1_joint", "zarm_l4_joint", "zarm_r4_joint"],
-            )
+            "std": 0.5,  # 标准差，控制奖励衰减速度
+            "asset_cfg": SceneEntityCfg("robot"),  # 跟踪所有关节
         },
     )
-    joint_deviation_arms = RewTerm(
-        func=mdp.joint_deviation_l1,
-        weight=-0.2,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["zarm_l2_joint", "zarm_r2_joint", "zarm_l3_joint", "zarm_r3_joint"])},
-    )
-    joint_deviation_legs = RewTerm(
-        func=mdp.joint_deviation_l1,
-        weight=-0.02,
+    
+    # 关节速度跟踪 - 鼓励平滑运动
+    # 权重建议：-0.01 到 -0.1
+    joint_vel_tracking_all = RewTerm(
+        func=mdp.joint_vel_tracking_l2,
+        weight=-0.05,
         params={
-            "asset_cfg": SceneEntityCfg(
-                "robot",
-                joint_names=[
-                    "leg_l2_joint", "leg_r2_joint", "leg_l4_joint", "leg_r4_joint",
-                    "leg_l5_joint", "leg_r5_joint", "leg_l6_joint", "leg_r6_joint",
-                ],
-            )
+            "asset_cfg": SceneEntityCfg("robot"),  # 跟踪所有关节
         },
     )
+    
 
 
 @configclass
@@ -401,9 +343,20 @@ class RobanWalkAgentCfg(RslRlOnPolicyRunnerCfg):
     load_checkpoint = "model_.*.pt"
 
     # amp parameter
-    amp_reward_coef = 0.3
+    # 使用与 amp_roban_share 一致的奖励计算机制
+    # 奖励组合方式：combined_reward = task_reward_weight * task_reward + style_reward_weight * style_reward
     amp_motion_files = ["legged_lab/envs/roban/datasets/motion_amp_expert/walk_pb_easy.txt"]
     amp_num_preload_transitions = 200000
-    amp_task_reward_lerp = 0.7
     amp_discr_hidden_dims = [1024, 512, 256]
-    min_normalized_std = [0.05] * 20
+    min_normalized_std = [0.05] * 54  # AMP obs dim: 21 joint_pos + 21 joint_vel + 12 end_effector
+    
+    # 向后兼容参数（如果使用旧机制）
+    amp_reward_coef = 0.3  # 仅用于向后兼容，新机制不使用
+    amp_task_reward_lerp = 0.0  # 设置为0以禁用旧机制
+    
+    # 新奖励组合参数（与 amp_roban_share 一致）
+    task_reward_weight = 1.0              # Task 奖励权重（对应 amp_roban_share 的 task_reward_weight）
+    style_reward_weight = 0.02            # AMP 风格奖励权重（对应 amp_roban_share 的 style_reward_weight）
+    discriminator_reward_scale = 2.0      # 判别器奖励缩放（对应 amp_roban_share 的 discriminator_reward_scale）
+    # 最终奖励 = 1.0 * task_reward + 0.02 * (discriminator_reward_scale * style_reward)
+    # AMP 贡献最大 = 0.02 * 2.0 = 0.04（当 style_reward = 1.0 时）

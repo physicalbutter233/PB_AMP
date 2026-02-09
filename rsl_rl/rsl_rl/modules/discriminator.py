@@ -45,6 +45,11 @@ class Discriminator(nn.Module):
         self.device = device
         self.input_dim = input_dim
 
+        # 打印配置参数（确保正确接收）
+        print(f"[Discriminator] 初始化参数:")
+        print(f"  amp_reward_coef = {amp_reward_coef}")
+        print(f"  task_reward_lerp = {task_reward_lerp}")
+
         self.amp_reward_coef = amp_reward_coef
         amp_layers = []
         curr_in_dim = input_dim
@@ -140,3 +145,32 @@ class Discriminator(nn.Module):
         """
         r = (1.0 - self.task_reward_lerp) * disc_r + self.task_reward_lerp * task_r
         return r
+
+    def predict_style_reward(self, state, next_state, normalizer=None, reward_scale=1.0):
+        """
+        Predict the AMP style reward (without lerp with task reward).
+        This matches the behavior of amp_roban_share.
+
+        Args:
+            state (torch.Tensor): Current state tensor.
+            next_state (torch.Tensor): Next state tensor.
+            normalizer (optional): Normalizer object to normalize input states before prediction.
+            reward_scale (float): Scale factor for the reward (equivalent to discriminator_reward_scale).
+
+        Returns:
+            tuple:
+                - reward (torch.Tensor): Predicted AMP style reward with shape (batch_size,).
+                - d (torch.Tensor): Raw discriminator output logits with shape (batch_size, 1).
+        """
+        with torch.no_grad():
+            self.eval()
+            if normalizer is not None:
+                state = normalizer.normalize_torch(state, self.device)
+                next_state = normalizer.normalize_torch(next_state, self.device)
+
+            d = self.amp_linear(self.trunk(torch.cat([state, next_state], dim=-1)))
+            # Compute style reward: clamp(1 - (1/4) * (d - 1)^2, min=0) * reward_scale
+            # This matches amp_roban_share's MSE discriminator_loss_type
+            reward = reward_scale * torch.clamp(1 - (1 / 4) * torch.square(d - 1), min=0)
+            self.train()
+        return reward.squeeze(), d

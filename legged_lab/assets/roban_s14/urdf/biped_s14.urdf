@@ -2,6 +2,62 @@
 <robot name="biped_s14">
   <mujoco>
     <compiler meshdir="../meshes/" balanceinertia="true" discardvisual="false" />
+    <!-- Add site to base_link via worldbody override -->
+    <worldbody>
+      <body name="base_link" pos="0 0 0.68">
+        <site name="imu" pos="0 0 0" />
+      </body>
+    </worldbody>
+    <!-- Sensor definitions -->
+    <sensor>
+      <accelerometer name="BodyAcc" site="imu"/>
+      <velocimeter name="BodyVel" site="imu"/>
+      <gyro name="BodyGyro" site="imu"/>
+      <framepos name="BodyPos" objtype="site" objname="imu"/>
+      <framequat name="BodyQuat" objtype="site" objname="imu"/>
+      <jointpos name="waist_yaw_joint_pos" joint="waist_yaw_joint" />
+      <jointpos name="leg_l1_joint_pos" joint="leg_l1_joint" />
+      <jointpos name="leg_l2_joint_pos" joint="leg_l2_joint" />
+      <jointpos name="leg_l3_joint_pos" joint="leg_l3_joint" />
+      <jointpos name="leg_l4_joint_pos" joint="leg_l4_joint" />
+      <jointpos name="leg_l5_joint_pos" joint="leg_l5_joint" />
+      <jointpos name="leg_l6_joint_pos" joint="leg_l6_joint" />
+      <jointpos name="leg_r1_joint_pos" joint="leg_r1_joint" />
+      <jointpos name="leg_r2_joint_pos" joint="leg_r2_joint" />
+      <jointpos name="leg_r3_joint_pos" joint="leg_r3_joint" />
+      <jointpos name="leg_r4_joint_pos" joint="leg_r4_joint" />
+      <jointpos name="leg_r5_joint_pos" joint="leg_r5_joint" />
+      <jointpos name="leg_r6_joint_pos" joint="leg_r6_joint" />
+      <jointpos name="zarm_l1_joint_pos" joint="zarm_l1_joint" />
+      <jointpos name="zarm_l2_joint_pos" joint="zarm_l2_joint" />
+      <jointpos name="zarm_l3_joint_pos" joint="zarm_l3_joint" />
+      <jointpos name="zarm_l4_joint_pos" joint="zarm_l4_joint" />
+      <jointpos name="zarm_r1_joint_pos" joint="zarm_r1_joint" />
+      <jointpos name="zarm_r2_joint_pos" joint="zarm_r2_joint" />
+      <jointpos name="zarm_r3_joint_pos" joint="zarm_r3_joint" />
+      <jointpos name="zarm_r4_joint_pos" joint="zarm_r4_joint" />
+      <jointvel name="leg_l1_joint_vel" joint="leg_l1_joint" />
+      <jointvel name="leg_l2_joint_vel" joint="leg_l2_joint" />
+      <jointvel name="leg_l3_joint_vel" joint="leg_l3_joint" />
+      <jointvel name="leg_l4_joint_vel" joint="leg_l4_joint" />
+      <jointvel name="leg_l5_joint_vel" joint="leg_l5_joint" />
+      <jointvel name="leg_l6_joint_vel" joint="leg_l6_joint" />
+      <jointvel name="leg_r1_joint_vel" joint="leg_r1_joint" />
+      <jointvel name="leg_r2_joint_vel" joint="leg_r2_joint" />
+      <jointvel name="leg_r3_joint_vel" joint="leg_r3_joint" />
+      <jointvel name="leg_r4_joint_vel" joint="leg_r4_joint" />
+      <jointvel name="leg_r5_joint_vel" joint="leg_r5_joint" />
+      <jointvel name="leg_r6_joint_vel" joint="leg_r6_joint" />
+      <jointvel name="waist_yaw_joint_vel" joint="waist_yaw_joint" />
+      <jointvel name="zarm_l1_joint_vel" joint="zarm_l1_joint" />
+      <jointvel name="zarm_l2_joint_vel" joint="zarm_l2_joint" />
+      <jointvel name="zarm_l3_joint_vel" joint="zarm_l3_joint" />
+      <jointvel name="zarm_l4_joint_vel" joint="zarm_l4_joint" />
+      <jointvel name="zarm_r1_joint_vel" joint="zarm_r1_joint" />
+      <jointvel name="zarm_r2_joint_vel" joint="zarm_r2_joint" />
+      <jointvel name="zarm_r3_joint_vel" joint="zarm_r3_joint" />
+      <jointvel name="zarm_r4_joint_vel" joint="zarm_r4_joint" />
+    </sensor>
   </mujoco>
   <!-- <link name="dummy_link" />   -->
   <link name="base_link">

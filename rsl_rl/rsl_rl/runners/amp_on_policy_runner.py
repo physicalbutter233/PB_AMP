@@ -115,13 +115,35 @@ class AmpOnPolicyRunner:
             motion_files=train_cfg["amp_motion_files"],
         )
         amp_normalizer = Normalizer(amp_data.observation_dim)
+        
+        # 打印 AMP 配置（确保配置正确加载）
+        print("=" * 80)
+        print("[AmpOnPolicyRunner] AMP 配置:")
+        print(f"  amp_reward_coef = {train_cfg.get('amp_reward_coef', 'N/A')}")
+        print(f"  amp_task_reward_lerp = {train_cfg.get('amp_task_reward_lerp', 'N/A')}")
+        # New reward combination parameters (matching amp_roban_share)
+        print(f"  task_reward_weight = {train_cfg.get('task_reward_weight', 1.0)}")
+        print(f"  style_reward_weight = {train_cfg.get('style_reward_weight', 0.02)}")
+        print(f"  discriminator_reward_scale = {train_cfg.get('discriminator_reward_scale', 2.0)}")
+        print("=" * 80)
+        
+        # Use task_reward_lerp for backward compatibility, but prefer new parameters
+        task_reward_lerp = train_cfg.get("amp_task_reward_lerp", 0.0)
+        amp_reward_coef = train_cfg.get("amp_reward_coef", 0.3)
+        
         discriminator = Discriminator(
             amp_data.observation_dim * 2,
-            train_cfg["amp_reward_coef"],
+            amp_reward_coef,
             train_cfg["amp_discr_hidden_dims"],
             device,
-            train_cfg["amp_task_reward_lerp"],
+            task_reward_lerp,
         ).to(self.device)
+        
+        # 验证 Discriminator 中的配置
+        print(f"[AmpOnPolicyRunner] Discriminator 实际配置:")
+        print(f"  discriminator.amp_reward_coef = {discriminator.amp_reward_coef}")
+        print(f"  discriminator.task_reward_lerp = {discriminator.task_reward_lerp}")
+        print("=" * 80)
         min_std = torch.zeros(len(train_cfg["min_normalized_std"]), device=self.device, requires_grad=False)
 
         # initialize algorithm
@@ -136,6 +158,23 @@ class AmpOnPolicyRunner:
             **self.alg_cfg,
             multi_gpu_cfg=self.multi_gpu_cfg,
         )
+        
+        # Set AMP reward combination parameters (matching amp_roban_share)
+        self.alg.task_reward_weight = train_cfg.get("task_reward_weight", 1.0)
+        self.alg.style_reward_weight = train_cfg.get("style_reward_weight", 0.02)
+        self.alg.discriminator_reward_scale = train_cfg.get("discriminator_reward_scale", 2.0)
+        # Enable new reward combination if new parameters are provided
+        self.alg.use_amp_reward_combination = (
+            "task_reward_weight" in train_cfg or 
+            "style_reward_weight" in train_cfg or
+            "discriminator_reward_scale" in train_cfg
+        )
+        
+        print(f"[AmpOnPolicyRunner] AMP reward combination enabled: {self.alg.use_amp_reward_combination}")
+        if self.alg.use_amp_reward_combination:
+            print(f"  task_reward_weight = {self.alg.task_reward_weight}")
+            print(f"  style_reward_weight = {self.alg.style_reward_weight}")
+            print(f"  discriminator_reward_scale = {self.alg.discriminator_reward_scale}")
 
         # store training configuration
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
@@ -225,6 +264,13 @@ class AmpOnPolicyRunner:
             irewbuffer = deque(maxlen=100)
             cur_ereward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
             cur_ireward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+        
+        # For monitoring AMP reward combination (independent of RND)
+        if self.alg.use_amp_reward_combination:
+            taskrewbuffer = deque(maxlen=100)
+            amprewbuffer = deque(maxlen=100)
+            cur_task_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
+            cur_amp_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
         # Ensure all parameters are in-synced
         if self.is_distributed:
@@ -268,11 +314,31 @@ class AmpOnPolicyRunner:
                     terminal_amp_states = self.env.get_amp_obs_for_expert_trans()[reset_env_ids]
                     next_amp_obs_with_term[reset_env_ids] = terminal_amp_states
 
-                    rewards = self.alg.discriminator.predict_amp_reward(
-                        amp_obs, next_amp_obs_with_term, rewards, normalizer=self.alg.amp_normalizer
-                    )[0]
+                    # Compute rewards based on reward combination mode
+                    # Matching amp_roban_share: store task rewards and amp_states separately, combine during training
+                    if self.alg.use_amp_reward_combination:
+                        # New mode: separate task and AMP rewards (matching amp_roban_share)
+                        # Store task rewards as-is (no combination at env step)
+                        task_rewards = rewards.clone()
+                        # Compute AMP style reward but don't combine yet
+                        amp_rewards, _ = self.alg.discriminator.predict_style_reward(
+                            amp_obs, next_amp_obs_with_term, 
+                            normalizer=self.alg.amp_normalizer,
+                            reward_scale=self.alg.discriminator_reward_scale
+                        )
+                        # For bootstrapping: use task rewards only (matching amp_roban_share behavior)
+                        # Bootstrapping will be applied to task rewards, then combination happens in compute_returns
+                        rewards = task_rewards.clone()
+                    else:
+                        # Old mode: lerp in discriminator (backward compatibility)
+                        rewards = self.alg.discriminator.predict_amp_reward(
+                            amp_obs, next_amp_obs_with_term, rewards, normalizer=self.alg.amp_normalizer
+                        )[0]
+                        task_rewards = None
+                        amp_rewards = None
+                    
                     amp_obs = torch.clone(next_amp_obs)
-                    self.alg.process_env_step(rewards, dones, infos, next_amp_obs_with_term)
+                    self.alg.process_env_step(rewards, dones, infos, next_amp_obs_with_term, task_rewards, amp_rewards)
 
                     # Extract intrinsic rewards (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
@@ -290,6 +356,12 @@ class AmpOnPolicyRunner:
                             cur_reward_sum += rewards + intrinsic_rewards
                         else:
                             cur_reward_sum += rewards
+                        
+                        # Update task and AMP rewards separately for monitoring
+                        if self.alg.use_amp_reward_combination and task_rewards is not None and amp_rewards is not None:
+                            cur_task_reward_sum += task_rewards
+                            cur_amp_reward_sum += amp_rewards
+                        
                         # Update episode length
                         cur_episode_length += 1
                         # Clear data for completed episodes
@@ -297,6 +369,13 @@ class AmpOnPolicyRunner:
                         new_ids = (dones > 0).nonzero(as_tuple=False)
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                        
+                        # Store task and AMP rewards for completed episodes
+                        if self.alg.use_amp_reward_combination and task_rewards is not None and amp_rewards is not None:
+                            taskrewbuffer.extend(cur_task_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            amprewbuffer.extend(cur_amp_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            cur_task_reward_sum[new_ids] = 0
+                            cur_amp_reward_sum[new_ids] = 0
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
                         # -- intrinsic and extrinsic rewards
@@ -316,6 +395,16 @@ class AmpOnPolicyRunner:
 
             # update policy
             loss_dict = self.alg.update()
+            
+            # Add AMP reward combination metrics if enabled
+            if self.alg.use_amp_reward_combination and len(taskrewbuffer) > 0:
+                mean_task_reward = statistics.mean(taskrewbuffer)
+                mean_amp_reward = statistics.mean(amprewbuffer)
+                mean_total_reward = statistics.mean(rewbuffer)
+                amp_contribution = mean_amp_reward / mean_total_reward if mean_total_reward > 0 else 0.0
+                loss_dict["amp_task_reward"] = mean_task_reward
+                loss_dict["amp_style_reward"] = mean_amp_reward
+                loss_dict["amp_contribution_ratio"] = amp_contribution
 
             stop = time.time()
             learn_time = stop - start
@@ -426,6 +515,11 @@ class AmpOnPolicyRunner:
                     f"""{'Mean intrinsic reward:':>{pad}} {statistics.mean(locs['irewbuffer']):.2f}\n"""
                 )
             log_string += f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
+            # -- AMP reward combination info
+            if self.alg.use_amp_reward_combination and "amp_task_reward" in locs["loss_dict"]:
+                log_string += f"""{'Mean task reward:':>{pad}} {locs['loss_dict']['amp_task_reward']:.4f}\n"""
+                log_string += f"""{'Mean AMP reward:':>{pad}} {locs['loss_dict']['amp_style_reward']:.4f}\n"""
+                log_string += f"""{'AMP contribution:':>{pad}} {locs['loss_dict']['amp_contribution_ratio']*100:.2f}%\n"""
             # -- episode info
             log_string += f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
         else:

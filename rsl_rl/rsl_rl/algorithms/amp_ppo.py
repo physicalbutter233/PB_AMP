@@ -117,6 +117,13 @@ class AMPPPO:
         self.amp_storage = ReplayBuffer(discriminator.input_dim // 2, amp_replay_buffer_size, device)
         self.amp_data = amp_data
         self.amp_normalizer = amp_normalizer
+        
+        # AMP reward combination parameters (matching amp_roban_share)
+        # These will be set by the runner from config
+        self.task_reward_weight = 1.0
+        self.style_reward_weight = 0.02
+        self.discriminator_reward_scale = 2.0
+        self.use_amp_reward_combination = False  # Flag to enable new reward combination
 
         # PPO components
         self.policy = policy
@@ -182,11 +189,21 @@ class AMPPPO:
         self.amp_transition.observations = amp_obs
         return self.transition.actions
 
-    def process_env_step(self, rewards, dones, infos, amp_obs):
+    def process_env_step(self, rewards, dones, infos, amp_obs, task_rewards=None, amp_rewards=None):
         # Record the rewards and dones
-        # Note: we clone here because later on we bootstrap the rewards based on timeouts
-        self.transition.rewards = rewards.clone()
+        # Matching amp_roban_share: store task rewards and amp rewards separately, combine during training
         self.transition.dones = dones
+        
+        # Store task and AMP rewards separately for combination during training (matching amp_roban_share)
+        if self.use_amp_reward_combination and task_rewards is not None and amp_rewards is not None:
+            # Store task and AMP rewards separately (matching amp_roban_share)
+            self.transition.task_rewards = task_rewards.clone()
+            self.transition.amp_rewards = amp_rewards.clone()
+            # Use task rewards for bootstrapping (matching amp_roban_share: bootstrapping on task rewards)
+            self.transition.rewards = rewards.clone()  # rewards is task_rewards at this point
+        else:
+            # Old mode: use rewards as-is
+            self.transition.rewards = rewards.clone()
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
@@ -200,7 +217,7 @@ class AMPPPO:
             # Record the curiosity gates
             self.transition.rnd_state = rnd_state.clone()
 
-        # Bootstrapping on time outs
+        # Bootstrapping on time outs (matching amp_roban_share: applied to task rewards)
         if "time_outs" in infos:
             self.transition.rewards += self.gamma * torch.squeeze(
                 self.transition.values * infos["time_outs"].unsqueeze(1).to(self.device), 1
@@ -214,6 +231,17 @@ class AMPPPO:
         self.policy.reset(dones)
 
     def compute_returns(self, last_critic_obs):
+        # Combine task and AMP rewards if using new reward combination (matching amp_roban_share)
+        # Matching amp_roban_share: combination happens here, before computing returns
+        if self.use_amp_reward_combination and self.storage.task_rewards is not None and self.storage.amp_rewards is not None:
+            # Compute combined rewards: task_reward_weight * task_reward + style_reward_weight * style_reward
+            # Note: task_rewards already include bootstrapping (applied in process_env_step)
+            # We combine after bootstrapping, matching amp_roban_share behavior
+            self.storage.rewards = (
+                self.task_reward_weight * self.storage.task_rewards +
+                self.style_reward_weight * self.storage.amp_rewards
+            )
+        
         # compute value for the last step
         last_values = self.policy.evaluate(last_critic_obs).detach()
         self.storage.compute_returns(

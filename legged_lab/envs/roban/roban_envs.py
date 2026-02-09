@@ -334,31 +334,52 @@ class RobanEnv(VecEnv):
         left_foot_pos = quat_apply(quat_conjugate(self.robot.data.root_state_w[:, 3:7]), left_foot_pos)
         right_foot_pos = quat_apply(quat_conjugate(self.robot.data.root_state_w[:, 3:7]), right_foot_pos)
 
-        self.left_leg_dof_pos =  dof_pos[:, self.left_leg_ids] 
+        self.left_leg_dof_pos = dof_pos[:, self.left_leg_ids]
         self.right_leg_dof_pos = dof_pos[:, self.right_leg_ids]
-        self.left_leg_dof_vel =  dof_vel[:, self.left_leg_ids] 
+        self.left_leg_dof_vel = dof_vel[:, self.left_leg_ids]
         self.right_leg_dof_vel = dof_vel[:, self.right_leg_ids]
-        self.left_arm_dof_pos =  dof_pos[:, self.left_arm_ids] 
+        self.left_arm_dof_pos = dof_pos[:, self.left_arm_ids]
         self.right_arm_dof_pos = dof_pos[:, self.right_arm_ids]
-        self.left_arm_dof_vel =  dof_vel[:, self.left_arm_ids] 
+        self.left_arm_dof_vel = dof_vel[:, self.left_arm_ids]
         self.right_arm_dof_vel = dof_vel[:, self.right_arm_ids]
-        return torch.cat(
-            (
-                self.right_arm_dof_pos,
-                self.left_arm_dof_pos,
-                self.right_leg_dof_pos,
-                self.left_leg_dof_pos,
-                self.right_arm_dof_vel,
-                self.left_arm_dof_vel,
-                self.right_leg_dof_vel,
-                self.left_leg_dof_vel,
-                left_hand_pos,
-                right_hand_pos,
-                left_foot_pos,
-                right_foot_pos
-            ),
-            dim=-1,
-        )
+        # 输出与 get_amp_obs_for_expert_trans 一致的 54 维 AMP expert 格式
+        # 21 joint pos: waist, left_leg, right_leg, left_arm, right_arm
+        # 21 joint vel: 同上
+        # 12 end effector: left_hand, right_hand, left_foot, right_foot
+        if num_j == 21:
+            waist_pos = dof_pos[:, self.waist_ids]
+            waist_vel = dof_vel[:, self.waist_ids]
+            joint_pos_21 = torch.cat(
+                (waist_pos, self.left_leg_dof_pos, self.right_leg_dof_pos, self.left_arm_dof_pos, self.right_arm_dof_pos),
+                dim=-1,
+            )
+            joint_vel_21 = torch.cat(
+                (waist_vel, self.left_leg_dof_vel, self.right_leg_dof_vel, self.left_arm_dof_vel, self.right_arm_dof_vel),
+                dim=-1,
+            )
+            return torch.cat(
+                (joint_pos_21, joint_vel_21, left_hand_pos, right_hand_pos, left_foot_pos, right_foot_pos),
+                dim=-1,
+            )
+        else:
+            # TienKung 20 关节，无 waist
+            return torch.cat(
+                (
+                    self.right_arm_dof_pos,
+                    self.left_arm_dof_pos,
+                    self.right_leg_dof_pos,
+                    self.left_leg_dof_pos,
+                    self.right_arm_dof_vel,
+                    self.left_arm_dof_vel,
+                    self.right_leg_dof_vel,
+                    self.left_leg_dof_vel,
+                    left_hand_pos,
+                    right_hand_pos,
+                    left_foot_pos,
+                    right_foot_pos,
+                ),
+                dim=-1,
+            )
 
     def compute_current_observations(self):
         robot = self.robot
@@ -371,22 +392,27 @@ class RobanEnv(VecEnv):
         joint_vel = robot.data.joint_vel - robot.data.default_joint_vel
         action = self.action_buffer._circular_buffer.buffer[:, -1, :]
         root_lin_vel = robot.data.root_lin_vel_b
-        feet_contact = torch.max(torch.norm(net_contact_forces[:, :, self.feet_cfg.body_ids], dim=-1), dim=1)[0] > 0.5
+        feet_contact = (torch.max(torch.norm(net_contact_forces[:, :, self.feet_cfg.body_ids], dim=-1), dim=1)[0] > 0.5).float()
 
-        current_actor_obs = torch.cat(
-            [
-                ang_vel * self.obs_scales.ang_vel,  # 3
-                projected_gravity * self.obs_scales.projected_gravity,  # 3
-                command * self.obs_scales.commands,  # 3
-                joint_pos * self.obs_scales.joint_pos,  # 20
-                joint_vel * self.obs_scales.joint_vel,  # 20
-                action * self.obs_scales.actions,  # 20
+        # 构建基础观察值（不包含步态信息）
+        base_obs = [
+            ang_vel * self.obs_scales.ang_vel,  # 3
+            projected_gravity * self.obs_scales.projected_gravity,  # 3
+            command * self.obs_scales.commands,  # 3
+            joint_pos * self.obs_scales.joint_pos,  # 21 (waist+legs+arms)
+            joint_vel * self.obs_scales.joint_vel,  # 21
+            action * self.obs_scales.actions,  # 21
+        ]
+        
+        # 根据配置决定是否包含步态信息
+        if getattr(self.cfg.robot, 'include_gait_in_obs', True):
+            base_obs.extend([
                 torch.sin(2 * torch.pi * self.gait_phase),  # 2
                 torch.cos(2 * torch.pi * self.gait_phase),  # 2
                 self.phase_ratio,  # 2
-            ],
-            dim=-1,
-        )
+            ])
+        
+        current_actor_obs = torch.cat(base_obs, dim=-1)
         current_critic_obs = torch.cat([current_actor_obs, root_lin_vel * self.obs_scales.lin_vel, feet_contact], dim=-1)
 
         return current_actor_obs, current_critic_obs
@@ -550,7 +576,9 @@ class RobanEnv(VecEnv):
         return actor_obs, self.extras
 
     def get_amp_obs_for_expert_trans(self):
-        """Gets amp obs from policy"""
+        """AMP obs for 21-DoF Roban: joint_pos(21) + joint_vel(21) + end_effector_pos(12) = 54.
+        Order: waist, left_leg, right_leg, left_arm, right_arm (pos then vel), then hand/foot positions.
+        """
         left_hand_pos = (
             self.robot.data.body_state_w[:, self.elbow_body_ids[0], :3]
             - self.robot.data.root_state_w[:, 0:3]
@@ -571,6 +599,8 @@ class RobanEnv(VecEnv):
         )
         left_foot_pos = quat_apply(quat_conjugate(self.robot.data.root_state_w[:, 3:7]), left_foot_pos)
         right_foot_pos = quat_apply(quat_conjugate(self.robot.data.root_state_w[:, 3:7]), right_foot_pos)
+        waist_pos = self.robot.data.joint_pos[:, self.waist_ids]
+        waist_vel = self.robot.data.joint_vel[:, self.waist_ids]
         self.left_leg_dof_pos = self.robot.data.joint_pos[:, self.left_leg_ids]
         self.right_leg_dof_pos = self.robot.data.joint_pos[:, self.right_leg_ids]
         self.left_leg_dof_vel = self.robot.data.joint_vel[:, self.left_leg_ids]
@@ -579,16 +609,19 @@ class RobanEnv(VecEnv):
         self.right_arm_dof_pos = self.robot.data.joint_pos[:, self.right_arm_ids]
         self.left_arm_dof_vel = self.robot.data.joint_vel[:, self.left_arm_ids]
         self.right_arm_dof_vel = self.robot.data.joint_vel[:, self.right_arm_ids]
+        # 21 joint pos: waist, left_leg, right_leg, left_arm, right_arm
+        joint_pos_21 = torch.cat(
+            (waist_pos, self.left_leg_dof_pos, self.right_leg_dof_pos, self.left_arm_dof_pos, self.right_arm_dof_pos),
+            dim=-1,
+        )
+        joint_vel_21 = torch.cat(
+            (waist_vel, self.left_leg_dof_vel, self.right_leg_dof_vel, self.left_arm_dof_vel, self.right_arm_dof_vel),
+            dim=-1,
+        )
         return torch.cat(
             (
-                self.right_arm_dof_pos,
-                self.left_arm_dof_pos,
-                self.right_leg_dof_pos,
-                self.left_leg_dof_pos,
-                self.right_arm_dof_vel,
-                self.left_arm_dof_vel,
-                self.right_leg_dof_vel,
-                self.left_leg_dof_vel,
+                joint_pos_21,
+                joint_vel_21,
                 left_hand_pos,
                 right_hand_pos,
                 left_foot_pos,
