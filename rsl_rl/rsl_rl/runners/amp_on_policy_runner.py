@@ -575,11 +575,24 @@ class AmpOnPolicyRunner:
         if self.logger_type in ["neptune", "wandb"] and not self.disable_logs:
             self.writer.save_model(path, self.current_learning_iteration)
 
-    def load(self, path: str, load_optimizer: bool = True):
+    def load(self, path: str, load_optimizer: bool = True, skip_discriminator_on_mismatch: bool = False):
         loaded_dict = torch.load(path, weights_only=False)
         # -- Load model
         resumed_training = self.alg.policy.load_state_dict(loaded_dict["model_state_dict"])
-        self.alg.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"])
+        
+        # Try to load discriminator, skip if dimension mismatch (for play/inference)
+        try:
+            self.alg.discriminator.load_state_dict(loaded_dict["discriminator_state_dict"])
+        except RuntimeError as e:
+            if "size mismatch" in str(e) and skip_discriminator_on_mismatch:
+                print(f"[WARNING] Discriminator dimension mismatch detected. Skipping discriminator load.")
+                print(f"  Checkpoint discriminator input dim: {loaded_dict['discriminator_state_dict']['trunk.0.weight'].shape[1]}")
+                print(f"  Current discriminator input dim: {self.alg.discriminator.input_dim}")
+                print(f"  This is expected when playing with a checkpoint trained with different AMP observation dimensions.")
+                print(f"  Policy will work, but discriminator will use random weights (not needed for inference).")
+            else:
+                raise e
+        
         self.alg.amp_normalizer = loaded_dict["amp_normalizer"]
         # -- Load RND model if used
         if self.alg.rnd:

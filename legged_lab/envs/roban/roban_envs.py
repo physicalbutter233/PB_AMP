@@ -342,9 +342,10 @@ class RobanEnv(VecEnv):
         self.right_arm_dof_pos = dof_pos[:, self.right_arm_ids]
         self.left_arm_dof_vel = dof_vel[:, self.left_arm_ids]
         self.right_arm_dof_vel = dof_vel[:, self.right_arm_ids]
-        # 输出与 get_amp_obs_for_expert_trans 一致的 54 维 AMP expert 格式
+        # 输出与 get_amp_obs_for_expert_trans 一致的 67 维 AMP expert 格式
         # 21 joint pos: waist, left_leg, right_leg, left_arm, right_arm
         # 21 joint vel: 同上
+        # 1 root height + 6 root rotation + 3 root lin_vel + 3 root ang_vel
         # 12 end effector: left_hand, right_hand, left_foot, right_foot
         if num_j == 21:
             waist_pos = dof_pos[:, self.waist_ids]
@@ -357,8 +358,36 @@ class RobanEnv(VecEnv):
                 (waist_vel, self.left_leg_dof_vel, self.right_leg_dof_vel, self.left_arm_dof_vel, self.right_arm_dof_vel),
                 dim=-1,
             )
+            
+            # Root state information
+            root_quat = self.robot.data.root_state_w[:, 3:7]  # Quaternion (w, x, y, z)
+            root_height = self.robot.data.root_state_w[:, 2:3]  # Root height (z coordinate)
+            
+            # Convert quaternion to tangent and normal vectors (6D)
+            root_rotation = self._quaternion_to_tangent_and_normal(root_quat)
+            
+            # Root linear and angular velocities (in root frame)
+            root_lin_vel_w = self.robot.data.root_state_w[:, 7:10]  # World frame
+            root_ang_vel_w = self.robot.data.root_state_w[:, 10:13]  # World frame
+            
+            # Transform velocities to root frame
+            root_lin_vel_b = quat_apply(quat_conjugate(root_quat), root_lin_vel_w)
+            root_ang_vel_b = quat_apply(quat_conjugate(root_quat), root_ang_vel_w)
+            
+            # Return 67-dim AMP observation (same format as get_amp_obs_for_expert_trans)
             return torch.cat(
-                (joint_pos_21, joint_vel_21, left_hand_pos, right_hand_pos, left_foot_pos, right_foot_pos),
+                (
+                    joint_pos_21,
+                    joint_vel_21,
+                    root_height,
+                    root_rotation,
+                    root_lin_vel_b,
+                    root_ang_vel_b,
+                    left_hand_pos,
+                    right_hand_pos,
+                    left_foot_pos,
+                    right_foot_pos,
+                ),
                 dim=-1,
             )
         else:
@@ -576,8 +605,12 @@ class RobanEnv(VecEnv):
         return actor_obs, self.extras
 
     def get_amp_obs_for_expert_trans(self):
-        """AMP obs for 21-DoF Roban: joint_pos(21) + joint_vel(21) + end_effector_pos(12) = 54.
-        Order: waist, left_leg, right_leg, left_arm, right_arm (pos then vel), then hand/foot positions.
+        """AMP obs for 21-DoF Roban with root state: 
+        joint_pos(21) + joint_vel(21) + root_height(1) + 
+        root_rotation(6) + root_lin_vel(3) + root_ang_vel(3) + 
+        end_effector_pos(12) = 67.
+        Order: waist, left_leg, right_leg, left_arm, right_arm (pos then vel), 
+        then root state, then hand/foot positions.
         """
         left_hand_pos = (
             self.robot.data.body_state_w[:, self.elbow_body_ids[0], :3]
@@ -618,10 +651,30 @@ class RobanEnv(VecEnv):
             (waist_vel, self.left_leg_dof_vel, self.right_leg_dof_vel, self.left_arm_dof_vel, self.right_arm_dof_vel),
             dim=-1,
         )
+        
+        # Root state information
+        root_quat = self.robot.data.root_state_w[:, 3:7]  # Quaternion (w, x, y, z)
+        root_height = self.robot.data.root_state_w[:, 2:3]  # Root height (z coordinate)
+        
+        # Convert quaternion to tangent and normal vectors (6D)
+        root_rotation = self._quaternion_to_tangent_and_normal(root_quat)
+        
+        # Root linear and angular velocities (in root frame)
+        root_lin_vel_w = self.robot.data.root_state_w[:, 7:10]  # World frame
+        root_ang_vel_w = self.robot.data.root_state_w[:, 10:13]  # World frame
+        
+        # Transform velocities to root frame
+        root_lin_vel_b = quat_apply(quat_conjugate(root_quat), root_lin_vel_w)
+        root_ang_vel_b = quat_apply(quat_conjugate(root_quat), root_ang_vel_w)
+        
         return torch.cat(
             (
                 joint_pos_21,
                 joint_vel_21,
+                root_height,
+                root_rotation,
+                root_lin_vel_b,
+                root_ang_vel_b,
                 left_hand_pos,
                 right_hand_pos,
                 left_foot_pos,
@@ -629,6 +682,26 @@ class RobanEnv(VecEnv):
             ),
             dim=-1,
         )
+    
+    @staticmethod
+    def _quaternion_to_tangent_and_normal(q: torch.Tensor) -> torch.Tensor:
+        """Convert quaternion to tangent and normal vectors.
+        
+        Args:
+            q: Quaternion tensor (w, x, y, z) with shape (..., 4)
+        
+        Returns:
+            Concatenated tangent and normal vectors with shape (..., 6)
+        """
+        ref_tangent = torch.zeros_like(q[..., :3])
+        ref_normal = torch.zeros_like(q[..., :3])
+        ref_tangent[..., 0] = 1  # Forward direction (x-axis)
+        ref_normal[..., -1] = 1   # Up direction (z-axis)
+        
+        tangent = quat_rotate(q, ref_tangent)
+        normal = quat_rotate(q, ref_normal)
+        
+        return torch.cat([tangent, normal], dim=len(tangent.shape) - 1)
 
     @staticmethod
     def seed(seed: int = -1) -> int:

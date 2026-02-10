@@ -101,29 +101,49 @@ def play():
 
     runner_class: OnPolicyRunner | AmpOnPolicyRunner = eval(agent_cfg.runner_class_name)
     runner = runner_class(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
-    runner.load(resume_path, load_optimizer=False)
+    
+    # For AMP runners, skip discriminator if dimension mismatch (play doesn't need discriminator)
+    if isinstance(runner, AmpOnPolicyRunner):
+        runner.load(resume_path, load_optimizer=False, skip_discriminator_on_mismatch=True)
+    else:
+        runner.load(resume_path, load_optimizer=False)
 
-    # 导出模型：创建适配层将单帧、无步态信息转换为训练格式
+    # 导出模型：创建适配层将单帧观察值转换为训练格式
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    print("[INFO] Exporting model with single-frame observations (no gait info)...")
     
-    # 创建适配层：将72维（单帧，无步态）转换为780维（10帧历史，有步态）
-    # 单帧无步态：72维 = 3(ang_vel) + 3(gravity) + 3(command) + 21(joint_pos) + 21(joint_vel) + 21(action)
-    # 单帧有步态：78维 = 72 + 6（步态信息：2(sin) + 2(cos) + 2(phase_ratio)）
-    # 10帧历史：780维 = 78 * 10
+    # 获取当前环境的观察空间维度
+    test_obs, _ = env.get_observations()
+    actual_obs_dim = test_obs.shape[1]
+    history_length = env.cfg.robot.actor_obs_history_length
+    single_frame_dim = actual_obs_dim // history_length
     
+    # 检查是否包含步态信息
+    include_gait = getattr(env.cfg.robot, 'include_gait_in_obs', True)
+    base_obs_dim = 3 + 3 + 3 + env.num_actions + env.num_actions + env.num_actions  # ang_vel + gravity + command + joint_pos + joint_vel + action
+    gait_dim = 6 if include_gait else 0  # sin(2) + cos(2) + phase_ratio(2)
+    expected_single_frame_dim = base_obs_dim + gait_dim
+    
+    print(f"[INFO] Current observation space:")
+    print(f"  - Total obs dimension: {actual_obs_dim}")
+    print(f"  - History length: {history_length}")
+    print(f"  - Single frame dimension: {single_frame_dim}")
+    print(f"  - Expected single frame dimension: {expected_single_frame_dim}")
+    print(f"  - Includes gait: {include_gait}")
+    print(f"  - Number of actions: {env.num_actions}")
+    
+    # 创建适配层：将单帧观察值转换为训练时的格式（10帧历史）
     class ObsAdapterActor(torch.nn.Module):
-        """适配层Actor：将单帧、无步态信息的观察值转换为训练时的格式"""
-        def __init__(self, original_actor, obs_normalizer=None):
+        """适配层Actor：将单帧观察值转换为训练时的格式"""
+        def __init__(self, original_actor, obs_normalizer=None, single_frame_dim=None, history_length=None):
             super().__init__()
-            # 只保存actor模块，避免TorchScript访问policy的其他属性
             self.original_actor = original_actor
             self.obs_normalizer = obs_normalizer
+            self.single_frame_dim = single_frame_dim
+            self.history_length = history_length
             
             # 为了兼容ONNX导出函数，需要让这个模块看起来像Sequential
-            # 创建一个假的Sequential，包含一个Linear层（输入72维，输出72维，实际上不会被使用）
-            # 导出函数会访问 self.actor[0].in_features
-            self._dummy_layer = torch.nn.Linear(72, 72)
+            # 创建一个假的Linear层（输入维度，输出维度，实际上不会被使用）
+            self._dummy_layer = torch.nn.Linear(single_frame_dim, single_frame_dim)
             
         def __getitem__(self, idx):
             """模拟Sequential的行为，用于ONNX导出"""
@@ -131,52 +151,54 @@ def play():
                 return self._dummy_layer
             raise IndexError(f"Index {idx} out of range")
             
-        def forward(self, obs_single_frame_no_gait):
+        def forward(self, obs_single_frame):
             """
             Args:
-                obs_single_frame_no_gait: [batch_size, 72] - 单帧，无步态信息
+                obs_single_frame: [batch_size, single_frame_dim] - 单帧观察值
             Returns:
-                actions: [batch_size, 21] - 动作
+                actions: [batch_size, num_actions] - 动作
             """
-            # 72维单帧无步态 -> 78维单帧有步态（添加6维零步态信息）
-            batch_size = obs_single_frame_no_gait.shape[0]
-            gait_info = torch.zeros(batch_size, 6, device=obs_single_frame_no_gait.device, dtype=obs_single_frame_no_gait.dtype)
-            obs_single_frame_with_gait = torch.cat([obs_single_frame_no_gait, gait_info], dim=1)  # [batch, 78]
+            batch_size = obs_single_frame.shape[0]
             
-            # 78维单帧 -> 780维10帧历史（重复当前帧10次）
-            obs_history = obs_single_frame_with_gait.unsqueeze(1).repeat(1, 10, 1)  # [batch, 10, 78]
-            obs_history = obs_history.reshape(batch_size, -1)  # [batch, 780]
+            # 单帧 -> 多帧历史（重复当前帧history_length次）
+            obs_history = obs_single_frame.unsqueeze(1).repeat(1, self.history_length, 1)  # [batch, history_length, single_frame_dim]
+            obs_history = obs_history.reshape(batch_size, -1)  # [batch, history_length * single_frame_dim]
             
             # 归一化（如果启用）
             if self.obs_normalizer is not None:
                 obs_history = self.obs_normalizer(obs_history)
             
-            # 直接通过actor模块（而不是policy.act_inference）
+            # 直接通过actor模块
             return self.original_actor(obs_history)
     
     class ObsAdapter(torch.nn.Module):
         """适配层：包装ObsAdapterActor以符合导出函数的接口"""
         is_recurrent = False  # 导出函数需要的属性
         
-        def __init__(self, original_policy, obs_normalizer=None):
+        def __init__(self, original_policy, obs_normalizer=None, single_frame_dim=None, history_length=None):
             super().__init__()
             # 创建独立的actor模块，避免循环引用
-            self.actor = ObsAdapterActor(original_policy, obs_normalizer)
+            self.actor = ObsAdapterActor(original_policy, obs_normalizer, single_frame_dim, history_length)
             
-        def forward(self, obs_single_frame_no_gait):
+        def forward(self, obs_single_frame):
             """转发到actor模块"""
-            return self.actor(obs_single_frame_no_gait)
+            return self.actor(obs_single_frame)
     
-    # 创建适配后的策略（只传递actor模块，避免TorchScript访问policy的其他属性）
-    adapted_policy = ObsAdapter(runner.alg.policy.actor, runner.obs_normalizer if runner.cfg["empirical_normalization"] else None)
+    # 创建适配后的策略
+    adapted_policy = ObsAdapter(
+        runner.alg.policy.actor, 
+        runner.obs_normalizer if runner.cfg.get("empirical_normalization", False) else None,
+        single_frame_dim=single_frame_dim,
+        history_length=history_length
+    )
     adapted_policy.eval()
     
-    # 创建测试输入（72维）
-    test_obs = torch.zeros(1, 72, device=agent_cfg.device)
+    # 创建测试输入
+    test_obs_single = torch.zeros(1, single_frame_dim, device=agent_cfg.device)
     with torch.inference_mode():
-        test_action = adapted_policy(test_obs)
-    print(f"[INFO] Export observation dimension: 72 (single-frame, no gait)")
-    print(f"[INFO] Test export policy: input {test_obs.shape} -> output {test_action.shape}")
+        test_action = adapted_policy(test_obs_single)
+    print(f"[INFO] Export observation dimension: {single_frame_dim} (single-frame)")
+    print(f"[INFO] Test export policy: input {test_obs_single.shape} -> output {test_action.shape}")
     
     # 导出适配后的模型
     export_policy_as_jit(adapted_policy, None, path=export_model_dir, filename="policy.pt")

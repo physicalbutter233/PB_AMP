@@ -214,7 +214,7 @@ def joint_vel_tracking_l2(
     return torch.sum(torch.square(joint_vel_diff), dim=1)
 
 
-def hip_roll_deadzone_penalty(
+def deadzone_penalty(
     env: BaseEnv,
     deadzone: float = 0.15,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),

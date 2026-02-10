@@ -48,11 +48,11 @@ from legged_lab.terrains import GRAVEL_TERRAINS_CFG, ROUGH_TERRAINS_CFG  # noqa:
 
 @configclass
 class GaitCfg:
-    gait_air_ratio_l: float = 0.38
-    gait_air_ratio_r: float = 0.38
-    gait_phase_offset_l: float = 0.38
-    gait_phase_offset_r: float = 0.88
-    gait_cycle: float = 0.85
+    gait_air_ratio_l: float = 0.5
+    gait_air_ratio_r: float = 0.5
+    gait_phase_offset_l: float = 0.0
+    gait_phase_offset_r: float = 0.5
+    gait_cycle: float = 1.0
 
 
 @configclass
@@ -148,6 +148,12 @@ class RobanLiteRewardCfg(LiteRewardCfg):
         },
     )
     
+    # ========== 步态周期奖励 (gait clock) ==========
+    # 摆动相：惩罚脚与地面的接触力 → 迫使机器人在该抬脚时抬脚
+    gait_feet_frc_perio = RewTerm(func=mdp.gait_feet_frc_perio, weight=3.0, params={"delta_t": 0.02})
+    # 支撑相：惩罚脚的移动速度 → 迫使机器人在该踩地时保持脚稳定
+    gait_feet_spd_perio = RewTerm(func=mdp.gait_feet_spd_perio, weight=3.0, params={"delta_t": 0.02})
+
     ## 以下是为了防止诡异行走而设置
 
     
@@ -160,7 +166,7 @@ class RobanLiteRewardCfg(LiteRewardCfg):
     # 侧向行走时自动放宽到 0.3rad(约17.2°)
     hip_roll_penalty = RewTerm(
         func=mdp.hip_roll_conditional_penalty,
-        weight=-2.0,
+        weight=-5.0,
         params={
             "deadzone_base": 0.1,    # 前向行走时的死区 (rad)
             "deadzone_max": 0.3,     # 侧向行走时的死区 (rad)
@@ -172,6 +178,21 @@ class RobanLiteRewardCfg(LiteRewardCfg):
         },
     )
     
+    # ========== 膝盖 Pitch (L4/R4) 限位惩罚 ==========
+    # 膝盖关节 axis=(0,1,0), 限位=[0.0, 2.618], 默认=0.5rad
+    # 正常走路时膝盖在默认值附近 ±0.5rad (0.0~1.0rad) 范围内弯曲/伸展
+    # 超出此范围则惩罚，防止膝盖过度弯曲或完全伸直锁死
+    knee_pitch_penalty = RewTerm(
+        func=mdp.deadzone_penalty,
+        weight=-5.0,
+        params={
+            "deadzone": 0.3,  # 允许默认值±0.5rad(约28.6°)的偏移
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["leg_l4_joint", "leg_r4_joint"],
+            ),
+        },
+    )
 
 
 @configclass
@@ -347,10 +368,10 @@ class RobanWalkAgentCfg(RslRlOnPolicyRunnerCfg):
     # amp parameter
     # 使用与 amp_roban_share 一致的奖励计算机制
     # 奖励组合方式：combined_reward = task_reward_weight * task_reward + style_reward_weight * style_reward
-    amp_motion_files = ["legged_lab/envs/roban/datasets/motion_amp_expert/walk_pb_easy.txt"]
+    amp_motion_files = ["legged_lab/envs/roban/datasets/motion_amp_expert/walk_pb_add_root.txt"]
     amp_num_preload_transitions = 200000
     amp_discr_hidden_dims = [1024, 512, 256]
-    min_normalized_std = [0.05] * 54  # AMP obs dim: 21 joint_pos + 21 joint_vel + 12 end_effector
+    min_normalized_std = [0.05] * 67  # AMP obs dim: 21 joint_pos + 21 joint_vel + 1 root_height + 6 root_rotation + 3 root_lin_vel + 3 root_ang_vel + 12 end_effector
     
     # 向后兼容参数（如果使用旧机制）
     amp_reward_coef = 0.3  # 仅用于向后兼容，新机制不使用
