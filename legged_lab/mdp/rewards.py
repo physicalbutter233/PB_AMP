@@ -214,6 +214,75 @@ def joint_vel_tracking_l2(
     return torch.sum(torch.square(joint_vel_diff), dim=1)
 
 
+def hip_roll_deadzone_penalty(
+    env: BaseEnv,
+    deadzone: float = 0.15,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """
+    Penalize hip roll (L2/R2) joints when they deviate beyond a dead zone from default.
+
+    Since L1/R1 axes are at 45° with axis=(0, ±0.707, -0.707), they mix pitch
+    and yaw but have NO X-component. This means L2 (roll, axis=(1,0,0)) does
+    NOT need to compensate for L1 motion during forward walking.
+
+    A dead zone allows minor balance adjustments while preventing leg splaying.
+    Recommended dead zone: 0.1–0.15 rad for forward walking.
+
+    Args:
+        env: The environment instance
+        deadzone: Maximum allowed deviation from default before penalty applies (rad)
+        asset_cfg: Scene entity configuration for hip roll joints
+
+    Returns:
+        Quadratic penalty for deviations beyond the dead zone
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    deviation = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    excess = torch.abs(deviation) - deadzone
+    excess = torch.clamp(excess, min=0.0)
+    return torch.sum(torch.square(excess), dim=1)
+
+
+def hip_roll_conditional_penalty(
+    env: BaseEnv,
+    deadzone_base: float = 0.1,
+    deadzone_max: float = 0.3,
+    vel_threshold: float = 0.3,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """
+    Velocity-conditioned hip roll penalty. Dead zone expands when lateral
+    velocity command is large, allowing proper lateral stepping while
+    preventing splay during forward walking.
+
+    When lateral velocity is near zero → tight dead zone (deadzone_base)
+    When lateral velocity is high → expanded dead zone (deadzone_max)
+
+    Args:
+        env: The environment instance
+        deadzone_base: Dead zone when not moving laterally (rad), default 0.1
+        deadzone_max: Dead zone when moving laterally at full speed (rad), default 0.3
+        vel_threshold: Lateral velocity at which dead zone reaches maximum (m/s)
+        asset_cfg: Scene entity configuration for hip roll joints
+
+    Returns:
+        Quadratic penalty for deviations beyond the velocity-conditioned dead zone
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    deviation = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+
+    # Compute velocity-dependent dead zone
+    lateral_vel_cmd = torch.abs(env.command_generator.command[:, 1])
+    vel_ratio = torch.clamp(lateral_vel_cmd / vel_threshold, max=1.0)
+    deadzone = deadzone_base + (deadzone_max - deadzone_base) * vel_ratio
+
+    # Apply dead zone (broadcast deadzone to per-joint dimension)
+    excess = torch.abs(deviation) - deadzone.unsqueeze(1)
+    excess = torch.clamp(excess, min=0.0)
+    return torch.sum(torch.square(excess), dim=1)
+
+
 def body_orientation_l2(
     env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:

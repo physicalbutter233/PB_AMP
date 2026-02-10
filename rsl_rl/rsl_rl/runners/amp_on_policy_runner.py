@@ -401,7 +401,12 @@ class AmpOnPolicyRunner:
                 mean_task_reward = statistics.mean(taskrewbuffer)
                 mean_amp_reward = statistics.mean(amprewbuffer)
                 mean_total_reward = statistics.mean(rewbuffer)
-                amp_contribution = mean_amp_reward / mean_total_reward if mean_total_reward > 0 else 0.0
+                # Calculate weighted rewards and combined total
+                weighted_task_reward = self.alg.task_reward_weight * mean_task_reward
+                weighted_amp_reward = self.alg.style_reward_weight * mean_amp_reward
+                total_combined_reward = weighted_task_reward + weighted_amp_reward
+                # AMP contribution is the ratio of weighted AMP reward to total combined reward
+                amp_contribution = weighted_amp_reward / total_combined_reward if total_combined_reward > 0 else 0.0
                 loss_dict["amp_task_reward"] = mean_task_reward
                 loss_dict["amp_style_reward"] = mean_amp_reward
                 loss_dict["amp_contribution_ratio"] = amp_contribution

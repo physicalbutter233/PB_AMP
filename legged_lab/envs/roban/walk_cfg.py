@@ -60,8 +60,8 @@ class LiteRewardCfg:
     """简化的奖励配置，与kuavo对应"""
     # 速度跟踪 (对应kuavo: tracking_lin_vel=1.2, tracking_ang_vel=1.1)
     # 大幅增加权重以使 AMP 占比降至 4%（Task 占比 96%）
-    track_lin_vel_xy_exp = RewTerm(func=mdp.track_lin_vel_xy_yaw_frame_exp, weight=5.0, params={"std": 0.5})  # 2.5 → 10.0
-    track_ang_vel_z_exp = RewTerm(func=mdp.track_ang_vel_z_world_exp, weight=4.0, params={"std": 0.5})         # 2.0 → 8.0
+    track_lin_vel_xy_exp = RewTerm(func=mdp.track_lin_vel_xy_yaw_frame_exp, weight=10.0, params={"std": 0.5})  # 2.5 → 10.0
+    track_ang_vel_z_exp = RewTerm(func=mdp.track_ang_vel_z_world_exp, weight=8.0, params={"std": 0.5})         # 2.0 → 8.0
     
     # 速度不匹配惩罚 (对应kuavo: vel_mismatch_exp=0.5)
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
@@ -149,24 +149,26 @@ class RobanLiteRewardCfg(LiteRewardCfg):
     )
     
     ## 以下是为了防止诡异行走而设置
-    # 全身关节位置跟踪（指数形式）- 奖励关节接近默认位置
-    # 权重建议：0.1 到 1.0，std 控制敏感度（越小越严格）
-    joint_pos_tracking_exp_all = RewTerm(
-        func=mdp.joint_pos_tracking_exp,
-        weight=0.3,
-        params={
-            "std": 0.5,  # 标准差，控制奖励衰减速度
-            "asset_cfg": SceneEntityCfg("robot"),  # 跟踪所有关节
-        },
-    )
+
     
-    # 关节速度跟踪 - 鼓励平滑运动
-    # 权重建议：-0.01 到 -0.1
-    joint_vel_tracking_all = RewTerm(
-        func=mdp.joint_vel_tracking_l2,
-        weight=-0.05,
+    # ========== 髋关节 Roll (L2/R2) 防劈叉惩罚 ==========
+    # 由于 L1/R1 的旋转轴 (0, ±0.707, -0.707) 没有 X 分量,
+    # L2/R2 (roll, 轴=X) 在正常前后行走时不需要补偿 L1 的运动.
+    # 因此可以较严格地约束 L2/R2, 防止双腿诡异岔开.
+    #
+    # 速度条件版本: 前向行走时 deadzone=0.1rad(约5.7°),
+    # 侧向行走时自动放宽到 0.3rad(约17.2°)
+    hip_roll_penalty = RewTerm(
+        func=mdp.hip_roll_conditional_penalty,
+        weight=-2.0,
         params={
-            "asset_cfg": SceneEntityCfg("robot"),  # 跟踪所有关节
+            "deadzone_base": 0.1,    # 前向行走时的死区 (rad)
+            "deadzone_max": 0.3,     # 侧向行走时的死区 (rad)
+            "vel_threshold": 0.3,    # 侧向速度阈值 (m/s)
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["leg_l2_joint", "leg_r2_joint"],
+            ),
         },
     )
     
