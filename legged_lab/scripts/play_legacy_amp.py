@@ -43,6 +43,11 @@ parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
+parser.add_argument(
+    "--cpu_physics",
+    action="store_true",
+    help="Use CPU for PhysX simulation (avoids GPU OOM when VRAM is full; slower).",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -248,6 +253,16 @@ def play():
         env_cfg.scene.num_envs = args_cli.num_envs
 
     env_cfg.scene.seed = agent_cfg.seed
+
+    # 缓解 PhysX GPU 显存不足：play 时降低 GPU 需求或使用 CPU 物理
+    # 若出现 PxgCudaDeviceMemoryAllocator failed to allocate memory，可加 --cpu_physics 或确保 --headless
+    env_cfg.sim.physx.gpu_max_rigid_patch_count = min(
+        env_cfg.sim.physx.gpu_max_rigid_patch_count, 2**14
+    )  # play 时减少 GPU 分配，避免 OOM
+    if getattr(args_cli, "cpu_physics", False):
+        env_cfg.device = "cpu"
+        agent_cfg.device = "cpu"
+        print("[INFO] Using CPU for PhysX simulation and policy (--cpu_physics).")
 
     env_class = task_registry.get_task_class(env_class_name)
     env = env_class(env_cfg, args_cli.headless)

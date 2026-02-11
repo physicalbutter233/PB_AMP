@@ -60,8 +60,8 @@ class LiteRewardCfg:
     """简化的奖励配置，与kuavo对应"""
     # 速度跟踪 (对应kuavo: tracking_lin_vel=1.2, tracking_ang_vel=1.1)
     # 大幅增加权重以使 AMP 占比降至 4%（Task 占比 96%）
-    track_lin_vel_xy_exp = RewTerm(func=mdp.track_lin_vel_xy_yaw_frame_exp, weight=10.0, params={"std": 0.5})  # 2.5 → 10.0
-    track_ang_vel_z_exp = RewTerm(func=mdp.track_ang_vel_z_world_exp, weight=8.0, params={"std": 0.5})         # 2.0 → 8.0
+    track_lin_vel_xy_exp = RewTerm(func=mdp.track_lin_vel_xy_yaw_frame_exp, weight=2.5, params={"std": 0.5})  # 2.5 → 10.0
+    track_ang_vel_z_exp = RewTerm(func=mdp.track_ang_vel_z_world_exp, weight=2.0, params={"std": 0.5})         # 2.0 → 8.0
     
     # 速度不匹配惩罚 (对应kuavo: vel_mismatch_exp=0.5)
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
@@ -220,20 +220,45 @@ class RobanLiteRewardCfg(LiteRewardCfg):
         },
     )
     
-    # # ========== 两脚距离惩罚 ==========
-    # # 惩罚两脚之间 3D 距离 < 20cm（太近/交叉）或 > 32cm（太远/劈叉）
-    # # 在 [20cm, 32cm] 范围内无惩罚
-    # feet_distance = RewTerm(
-    #     func=mdp.feet_distance_penalty,
-    #     weight=-5.0,
-    #     params={
-    #         "min_dist": 0.20,  # 最小允许距离 (m)
-    #         "max_dist": 0.30,  # 最大允许距离 (m)
-    #         "asset_cfg": SceneEntityCfg(
-    #             "robot",
-    #             body_names=["leg_l6_link", "leg_r6_link"],
-    #         ),
-    #     },
+    # ========== 两脚距离惩罚 ==========
+    # 惩罚两脚之间 3D 距离 < 20cm（太近/交叉）或 > 32cm（太远/劈叉）
+    # 在 [20cm, 32cm] 范围内无惩罚
+    feet_distance = RewTerm(
+        func=mdp.feet_distance_penalty,
+        weight=-5.0,
+        params={
+            "min_dist": 0.20,  # 最小允许距离 (m)
+            "max_dist": 0.30,  # 最大允许距离 (m)
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["leg_l6_link", "leg_r6_link"],
+            ),
+        },
+    )
+
+    # ========== 对称性奖励 (Symmetry Rewards) ==========
+    # 左右脚触地时间对称性：鼓励左右脚触地时间一致，防止瘸腿
+    feet_contact_time_symmetry = RewTerm(
+        func=mdp.feet_contact_time_symmetry_exp,
+        weight=1.6,
+        params={
+            "sigma": 0.25,
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
+        },
+    )
+
+    # # 关节位置对称性：惩罚左右关节位置不对称（代替 FFT 对称性分析的简化版本）
+    # joint_pos_symmetry = RewTerm(
+    #     func=mdp.joint_pos_symmetry_l2,
+    #     weight=-0.5,
+    #     params={},
+    # )
+
+    # # 关节速度对称性：惩罚左右关节速度不对称
+    # joint_vel_symmetry = RewTerm(
+    #     func=mdp.joint_vel_symmetry_l2,
+    #     weight=-0.001,
+    #     params={},
     # )
 
 
@@ -392,7 +417,12 @@ class RobanWalkAgentCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
         normalize_advantage_per_mini_batch=False,
-        symmetry_cfg=None,  # RslRlSymmetryCfg()
+        symmetry_cfg=RslRlSymmetryCfg(
+            use_data_augmentation=True,
+            use_mirror_loss=True,
+            data_augmentation_func="legged_lab.mdp.symmetry:roban_symmetry_augmentation",
+            mirror_loss_coeff=1.5,
+        ),
         rnd_cfg=None,  # RslRlRndCfg()
     )
     clip_actions = None
@@ -425,3 +455,11 @@ class RobanWalkAgentCfg(RslRlOnPolicyRunnerCfg):
     discriminator_reward_scale = 5.0      # 判别器奖励缩放（对应 amp_roban_share 的 discriminator_reward_scale）
     # 最终奖励 = 1.0 * task_reward + 0.02 * (discriminator_reward_scale * style_reward)
     # AMP 贡献最大 = 0.02 * 2.0 = 0.04（当 style_reward = 1.0 时）
+
+    # ===== 对称性额外参数 (传递给 AMPPPO via runner) =====
+    # Critic 对称性损失系数：V(obs) ≈ V(mirror(obs))
+    critic_mirror_loss_coeff: float = 1.5
+    # Discriminator 对称性损失模式：0=关闭, 1=仅 policy, 2=仅 expert, 3=两者都用
+    disc_sym_loss_mode: int = 3
+    # Discriminator 对称性损失系数
+    disc_mirror_loss_coeff: float = 1.5

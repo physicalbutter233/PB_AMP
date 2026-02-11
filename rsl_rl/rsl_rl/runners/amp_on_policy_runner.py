@@ -105,6 +105,16 @@ class AmpOnPolicyRunner:
         if "symmetry_cfg" in self.alg_cfg and self.alg_cfg["symmetry_cfg"] is not None:
             # this is used by the symmetry function for handling different observation terms
             self.alg_cfg["symmetry_cfg"]["_env"] = env
+            # Pass extra symmetry parameters from train_cfg (critic/disc symmetry)
+            self.alg_cfg["symmetry_cfg"]["critic_mirror_loss_coeff"] = train_cfg.get(
+                "critic_mirror_loss_coeff", 0.0
+            )
+            self.alg_cfg["symmetry_cfg"]["disc_sym_loss_mode"] = train_cfg.get(
+                "disc_sym_loss_mode", 0
+            )
+            self.alg_cfg["symmetry_cfg"]["disc_mirror_loss_coeff"] = train_cfg.get(
+                "disc_mirror_loss_coeff", 0.0
+            )
 
         # init amp loader
         amp_data = AMPLoader(

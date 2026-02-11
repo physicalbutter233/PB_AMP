@@ -80,7 +80,7 @@ def play():
     env_cfg.commands.ranges.lin_vel_x = (0.5, 0.5)
     env_cfg.commands.ranges.lin_vel_y = (0.0, 0.0)
 
-    env_cfg.commands.ranges.ang_vel_z = (0.0, 0.0)  # 禁止旋转，只向前走
+    env_cfg.commands.ranges.ang_vel_z = (0.0, 0.0)# 禁止旋转，只向前走
     env_cfg.scene.height_scanner.drift_range = (0.0, 0.0)
     env_cfg.scene.terrain_generator = None
     env_cfg.scene.terrain_type = "plane"

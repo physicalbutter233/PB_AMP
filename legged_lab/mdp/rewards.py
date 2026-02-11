@@ -511,3 +511,136 @@ def gait_feet_frc_support_perio(env: TienKungEnv, delta_t: float = 0.02) -> torc
     left_frc_score = left_frc_support_mask * (1 - torch.exp(-10 * torch.square(env.avg_feet_force_per_step[:, 0])))
     right_frc_score = right_frc_support_mask * (1 - torch.exp(-10 * torch.square(env.avg_feet_force_per_step[:, 1])))
     return left_frc_score + right_frc_score
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Symmetry Reward Functions (for biped gait symmetry enforcement)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def feet_contact_time_symmetry_exp(
+    env: BaseEnv, sigma: float = 0.25, sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor")
+) -> torch.Tensor:
+    """Reward symmetric stance durations between left and right feet (phase-aware).
+
+    跟踪每只脚**最近一次完整支撑相**的持续时间（从着地到抬脚），
+    然后比较左右脚的支撑时长是否一致。
+
+    在交替步态中，两只脚在不同时刻接触地面，所以不能直接比较瞬时的
+    contact_time（那样会鼓励双脚同步着地）。正确做法是比较"每次踩下去
+    持续了多久"——对称步态中左右应该一样。
+
+    检测逻辑：当 contact_time 从 >0 变为 0（抬脚瞬间），
+    记录上一步的 contact_time 作为该脚的"最近支撑时长"。
+
+    reward = exp(-(last_stance_left - last_stance_right)^2 / sigma^2)
+
+    Only active when:
+    - both feet have completed at least one stance phase
+    - command is non-zero
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    contact_time = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids]  # [batch, 2]
+
+    # ── 初始化状态跟踪缓冲区（首次调用时） ──
+    if not hasattr(env, "_sym_last_stance_dur"):
+        env._sym_last_stance_dur = torch.zeros(env.num_envs, 2, device=contact_time.device)
+        env._sym_prev_contact_time = torch.zeros(env.num_envs, 2, device=contact_time.device)
+
+    # ── 处理 episode 重置：新 episode 的前两步清空缓冲区 ──
+    fresh = env.episode_length_buf <= 1
+    if fresh.any():
+        env._sym_last_stance_dur[fresh] = 0
+        env._sym_prev_contact_time[fresh] = 0
+
+    # ── 检测抬脚事件（liftoff）──
+    # 上一步 contact_time > 0 且本步 contact_time == 0 → 脚刚抬起
+    liftoff = (env._sym_prev_contact_time > 0) & (contact_time == 0)
+
+    # 在抬脚瞬间，上一步的 contact_time 就是这次支撑相的总时长
+    env._sym_last_stance_dur = torch.where(
+        liftoff, env._sym_prev_contact_time, env._sym_last_stance_dur
+    )
+
+    # 更新 prev（为下一步检测做准备）
+    env._sym_prev_contact_time = contact_time.clone()
+
+    # ── 计算对称性奖励 ──
+    diff = env._sym_last_stance_dur[:, 0] - env._sym_last_stance_dur[:, 1]
+    reward = torch.exp(-torch.square(diff) / (sigma**2))
+
+    # 只有两只脚都完成过至少一次完整支撑相时才有效
+    valid = (env._sym_last_stance_dur[:, 0] > 0) & (env._sym_last_stance_dur[:, 1] > 0)
+    reward = reward * valid.float()
+
+    # 只在有速度指令时激活
+    has_command = (
+        torch.norm(env.command_generator.command[:, :2], dim=1)
+        # + torch.abs(env.command_generator.command[:, 2])  #暂时不考虑转圈时的表现
+    ) > 0.1
+    return reward * has_command
+
+
+# def joint_pos_symmetry_l2(
+#     env: BaseEnv,
+#     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+# ) -> torch.Tensor:
+#     """L2 penalty for asymmetric joint positions between left and right limbs.
+
+#     For each left-right joint pair, computes |q_left - sign * q_right|^2.
+#     The sign accounts for joints whose zero position is mirrored (e.g., hip_roll).
+
+#     This is a simpler alternative to FFT-based symmetry analysis.
+#     Returns the mean squared deviation (use with negative weight to penalize).
+#     """
+#     asset: Articulation = env.scene[asset_cfg.name]
+#     joint_pos = asset.data.joint_pos - asset.data.default_joint_pos
+
+#     total_asym = torch.zeros(env.num_envs, device=joint_pos.device)
+
+#     # Leg joints (6 pairs): sign pattern [-1, -1, -1, +1, +1, -1]
+#     leg_signs = torch.tensor([-1.0, -1.0, -1.0, +1.0, +1.0, -1.0], device=joint_pos.device)
+#     for i in range(6):
+#         q_l = joint_pos[:, env.left_leg_ids[i]]
+#         q_r = joint_pos[:, env.right_leg_ids[i]]
+#         total_asym += torch.square(q_l - leg_signs[i] * q_r)
+
+#     # Arm joints (4 pairs): sign pattern [+1, -1, -1, +1]
+#     arm_signs = torch.tensor([+1.0, -1.0, -1.0, +1.0], device=joint_pos.device)
+#     for i in range(4):
+#         q_l = joint_pos[:, env.left_arm_ids[i]]
+#         q_r = joint_pos[:, env.right_arm_ids[i]]
+#         total_asym += torch.square(q_l - arm_signs[i] * q_r)
+
+#     return total_asym / 10.0  # Normalize by number of pairs
+
+
+# def joint_vel_symmetry_l2(
+#     env: BaseEnv,
+#     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+# ) -> torch.Tensor:
+#     """L2 penalty for asymmetric joint velocities between left and right limbs.
+
+#     Similar to joint_pos_symmetry_l2 but operates on joint velocities.
+#     Symmetric gaits should have matching velocity patterns.
+#     """
+#     asset: Articulation = env.scene[asset_cfg.name]
+#     joint_vel = asset.data.joint_vel
+
+#     total_asym = torch.zeros(env.num_envs, device=joint_vel.device)
+
+#     # Leg joints (6 pairs)
+#     leg_signs = torch.tensor([-1.0, -1.0, -1.0, +1.0, +1.0, -1.0], device=joint_vel.device)
+#     for i in range(6):
+#         v_l = joint_vel[:, env.left_leg_ids[i]]
+#         v_r = joint_vel[:, env.right_leg_ids[i]]
+#         total_asym += torch.square(v_l - leg_signs[i] * v_r)
+
+#     # Arm joints (4 pairs)
+#     arm_signs = torch.tensor([+1.0, -1.0, -1.0, +1.0], device=joint_vel.device)
+#     for i in range(4):
+#         v_l = joint_vel[:, env.left_arm_ids[i]]
+#         v_r = joint_vel[:, env.right_arm_ids[i]]
+#         total_asym += torch.square(v_l - arm_signs[i] * v_r)
+
+#     return total_asym / 10.0  # Normalize by number of pairs

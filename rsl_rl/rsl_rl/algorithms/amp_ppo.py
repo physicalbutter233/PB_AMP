@@ -29,6 +29,9 @@ from rsl_rl.modules.rnd import RandomNetworkDistillation
 from rsl_rl.storage import ReplayBuffer, RolloutStorage
 from rsl_rl.utils import string_to_callable
 
+# Lazy import for AMP obs flipping (avoid circular imports)
+_flip_amp_obs_func = None
+
 
 class AMPPPO:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
@@ -264,8 +267,12 @@ class AMPPPO:
         # -- Symmetry loss
         if self.symmetry:
             mean_symmetry_loss = 0
+            mean_critic_symmetry_loss = 0
+            mean_disc_symmetry_loss = 0
         else:
             mean_symmetry_loss = None
+            mean_critic_symmetry_loss = None
+            mean_disc_symmetry_loss = None
 
         # generator for mini batches
         if self.policy.is_recurrent:
@@ -437,6 +444,29 @@ class AMPPPO:
                 else:
                     symmetry_loss = symmetry_loss.detach()
 
+            # Critic symmetry loss: V(obs) ≈ V(mirror(obs))
+            critic_symmetry_loss = torch.tensor(0.0, device=self.device)
+            if self.symmetry and self.symmetry.get("critic_mirror_loss_coeff", 0.0) > 0:
+                if self.symmetry["use_data_augmentation"] and num_aug >= 2:
+                    # critic_obs_batch already contains [original, mirrored]
+                    value_orig = self.policy.evaluate(critic_obs_batch[:original_batch_size])
+                    value_mirror = self.policy.evaluate(critic_obs_batch[original_batch_size:])
+                else:
+                    # Need to generate mirrored critic obs
+                    data_augmentation_func = self.symmetry["data_augmentation_func"]
+                    critic_obs_for_sym = critic_obs_batch[:original_batch_size]
+                    mirrored_critic_obs, _ = data_augmentation_func(
+                        obs=critic_obs_for_sym, actions=None, env=self.symmetry["_env"], obs_type="critic"
+                    )
+                    # Take mirrored part (second half of [original, mirrored])
+                    mirrored_critic_obs = mirrored_critic_obs[original_batch_size:]
+                    value_orig = self.policy.evaluate(critic_obs_for_sym)
+                    value_mirror = self.policy.evaluate(mirrored_critic_obs)
+                critic_symmetry_loss = self.symmetry["critic_mirror_loss_coeff"] * torch.mean(
+                    torch.square(value_mirror - value_orig.detach())
+                )
+                loss += critic_symmetry_loss
+
             # Random Network Distillation loss
             if self.rnd:
                 # predict the embedding and the target
@@ -462,6 +492,51 @@ class AMPPPO:
             amp_loss = 0.5 * (expert_loss + policy_loss)
             grad_pen_loss = self.discriminator.compute_grad_pen(*sample_amp_expert, lambda_=10)
             loss += self.amploss_coef * amp_loss + self.amploss_coef * grad_pen_loss
+
+            # Discriminator symmetry loss: D(amp_obs) ≈ D(mirror(amp_obs))
+            disc_symmetry_loss = torch.tensor(0.0, device=self.device)
+            disc_sym_mode = self.symmetry.get("disc_sym_loss_mode", 0) if self.symmetry else 0
+            if self.symmetry and disc_sym_mode > 0:
+                disc_sym_coeff = self.symmetry.get("disc_mirror_loss_coeff", 1.5)
+                # Lazy import flip_amp_obs
+                global _flip_amp_obs_func
+                if _flip_amp_obs_func is None:
+                    from legged_lab.mdp.symmetry import flip_amp_obs as _flip_amp_obs_func
+
+                sym_env = self.symmetry["_env"]
+                _disc_sym_loss = torch.tensor(0.0, device=self.device)
+                # Use raw (unnormalized) states from sample_amp_policy/expert
+                raw_policy_state, raw_policy_next_state = sample_amp_policy
+                raw_expert_state, raw_expert_next_state = sample_amp_expert
+
+                if disc_sym_mode in [1, 3]:
+                    # Policy AMP obs symmetry
+                    flip_p_state = _flip_amp_obs_func(raw_policy_state, sym_env)
+                    flip_p_next = _flip_amp_obs_func(raw_policy_next_state, sym_env)
+                    if self.amp_normalizer is not None:
+                        with torch.no_grad():
+                            flip_p_state = self.amp_normalizer.normalize_torch(flip_p_state, self.device)
+                            flip_p_next = self.amp_normalizer.normalize_torch(flip_p_next, self.device)
+                    d_policy_flip = self.discriminator(torch.cat([flip_p_state, flip_p_next], dim=-1))
+                    _disc_sym_loss = _disc_sym_loss + torch.nn.MSELoss()(
+                        d_policy_flip, policy_d.detach()
+                    )
+
+                if disc_sym_mode in [2, 3]:
+                    # Expert AMP obs symmetry
+                    flip_e_state = _flip_amp_obs_func(raw_expert_state, sym_env)
+                    flip_e_next = _flip_amp_obs_func(raw_expert_next_state, sym_env)
+                    if self.amp_normalizer is not None:
+                        with torch.no_grad():
+                            flip_e_state = self.amp_normalizer.normalize_torch(flip_e_state, self.device)
+                            flip_e_next = self.amp_normalizer.normalize_torch(flip_e_next, self.device)
+                    d_expert_flip = self.discriminator(torch.cat([flip_e_state, flip_e_next], dim=-1))
+                    _disc_sym_loss = _disc_sym_loss + torch.nn.MSELoss()(
+                        d_expert_flip, expert_d.detach()
+                    )
+
+                disc_symmetry_loss = disc_sym_coeff * _disc_sym_loss
+                loss += disc_symmetry_loss
 
             # Compute the gradients
             # -- For PPO
@@ -502,6 +577,8 @@ class AMPPPO:
             # -- Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+                mean_critic_symmetry_loss += critic_symmetry_loss.item()
+                mean_disc_symmetry_loss += disc_symmetry_loss.item()
 
         # -- For PPO
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -514,6 +591,8 @@ class AMPPPO:
         # -- For Symmetry
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+            mean_critic_symmetry_loss /= num_updates
+            mean_disc_symmetry_loss /= num_updates
         # -- Clear the storage
         mean_amp_loss /= num_updates
         mean_grad_pen_loss /= num_updates
@@ -535,6 +614,8 @@ class AMPPPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+            loss_dict["critic_symmetry"] = mean_critic_symmetry_loss
+            loss_dict["disc_symmetry"] = mean_disc_symmetry_loss
 
         return loss_dict
 
