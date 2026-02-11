@@ -80,7 +80,7 @@ class LiteRewardCfg:
     # 碰撞惩罚 (对应kuavo: collision=-1.0)
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
-        weight=-1.0,
+        weight=-3.0,
         params={
             "sensor_cfg": SceneEntityCfg(
                 "contact_sensor", body_names=["knee_pitch.*", "shoulder_roll.*", "elbow_pitch.*", "pelvis"]
@@ -148,13 +148,30 @@ class RobanLiteRewardCfg(LiteRewardCfg):
         },
     )
     
-    # ========== 滞空时间奖励 ==========
-    # 奖励单脚支撑时的滞空/触地时间，鼓励交替迈步（仅有速度指令时生效）
+    # ========== 滞空时间奖励（带裁剪） ==========
+    # 使用 last_air_time + first_contact 触发，仅在着地瞬间给奖励
+    # threshold_min=0.1: 低于 0.1s 的摆动不算步（防原地颤抖）
+    # threshold_max=0.3: 超过 0.3s 不再有额外奖励（防大跨步）
     feet_air_time = RewTerm(
-        func=mdp.feet_air_time_positive_biped,
+        func=mdp.feet_air_time_clip_biped,
         weight=10.0,
         params={
-            "threshold": 0.4,
+            "threshold_min": 0.25,
+            "threshold_max": 0.4,
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
+        },
+    )
+
+    # ========== 步频惩罚 ==========
+    # 惩罚双脚同时着地超过 0.2s，迫使机器人快速迈步
+    # 返回负惩罚值，用正 weight
+    step_frequency = RewTerm(
+        func=mdp.step_frequency_penalty,
+        weight=10.0,
+        params={
+            "max_grounded_time": 0.2,
+            "penalty_scale": 2.0,
+            "velocity_threshold": 0.12,
             "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
         },
     )
@@ -173,8 +190,8 @@ class RobanLiteRewardCfg(LiteRewardCfg):
         func=mdp.hip_roll_conditional_penalty,
         weight=-5.0,
         params={
-            "deadzone_base": 0.1,    # 前向行走时的死区 (rad)
-            "deadzone_max": 0.3,     # 侧向行走时的死区 (rad)
+            "deadzone_base": 0.2,    # 前向行走时的死区 (rad)
+            "deadzone_max": 0.4,     # 侧向行走时的死区 (rad)
             "vel_threshold": 0.3,    # 侧向速度阈值 (m/s)
             "asset_cfg": SceneEntityCfg(
                 "robot",
@@ -204,21 +221,21 @@ class RobanLiteRewardCfg(LiteRewardCfg):
     #     },
     # )
     
-    # ========== 膝盖 Pitch (L4/R4) 限位惩罚 ==========
-    # 膝盖关节 axis=(0,1,0), 限位=[0.0, 2.618], 默认=0.5rad
-    # 正常走路时膝盖在默认值附近 ±0.5rad (0.0~1.0rad) 范围内弯曲/伸展
-    # 超出此范围则惩罚，防止膝盖过度弯曲或完全伸直锁死
-    knee_pitch_penalty = RewTerm(
-        func=mdp.deadzone_penalty,
-        weight=-5.0,
-        params={
-            "deadzone": 0.3,  # 允许默认值±0.5rad(约28.6°)的偏移
-            "asset_cfg": SceneEntityCfg(
-                "robot",
-                joint_names=["leg_l4_joint", "leg_r4_joint"],
-            ),
-        },
-    )
+    # # ========== 膝盖 Pitch (L4/R4) 限位惩罚 ==========
+    # # 膝盖关节 axis=(0,1,0), 限位=[0.0, 2.618], 默认=0.5rad
+    # # 正常走路时膝盖在默认值附近 ±0.5rad (0.0~1.0rad) 范围内弯曲/伸展
+    # # 超出此范围则惩罚，防止膝盖过度弯曲或完全伸直锁死
+    # knee_pitch_penalty = RewTerm(
+    #     func=mdp.deadzone_penalty,
+    #     weight=-5.0,
+    #     params={
+    #         "deadzone": 0.3,  # 允许默认值±0.5rad(约28.6°)的偏移
+    #         "asset_cfg": SceneEntityCfg(
+    #             "robot",
+    #             joint_names=["leg_l4_joint", "leg_r4_joint"],
+    #         ),
+    #     },
+    # )
     
     # ========== 两脚距离惩罚 ==========
     # 惩罚两脚之间 3D 距离 < 20cm（太近/交叉）或 > 32cm（太远/劈叉）

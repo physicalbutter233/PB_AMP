@@ -514,6 +514,100 @@ def gait_feet_frc_support_perio(env: TienKungEnv, delta_t: float = 0.02) -> torc
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Stride / Step Frequency Control Rewards
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def feet_air_time_clip_biped(
+    env: BaseEnv,
+    threshold_min: float,
+    threshold_max: float,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Reward appropriate air time with min/max clipping.
+
+    与 feet_air_time_positive_biped 不同，本函数：
+    1. 使用 last_air_time（上一次完整摆动相时长），而非瞬时 current_air_time
+    2. 仅在**着地瞬间** (first_contact) 给出奖励
+    3. 低于 threshold_min 无奖励，超过 threshold_max 也不再增长
+
+    这样可以控制步幅：
+    - threshold_min=0.1: 太短的摆动不算步（防止原地颤抖）
+    - threshold_max=0.3: 超过 0.3s 的摆动不再有额外奖励（防止大跨步）
+
+    amp_roban_share 参考值：threshold_min=0.25, threshold_max=0.45
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    # first_contact: 本步刚着地的脚 (True)
+    first_contact = contact_sensor.compute_first_contact(env.step_dt)[:, sensor_cfg.body_ids]
+    # last_air_time: 上一次完整空中相的时长
+    last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
+
+    # 减去最小阈值，低于 min 的部分不奖励
+    air_time = (last_air_time - threshold_min) * first_contact
+    # 裁剪上限
+    air_time = torch.clamp(air_time, min=0.0, max=threshold_max - threshold_min)
+    reward = torch.sum(air_time, dim=1)
+    # 无指令时不奖励
+    reward *= (
+        torch.norm(env.command_generator.command[:, :2], dim=1)
+        + torch.abs(env.command_generator.command[:, 2])
+    ) > 0.1
+    return reward
+
+
+def step_frequency_penalty(
+    env: BaseEnv,
+    max_grounded_time: float = 0.2,
+    penalty_scale: float = 2.0,
+    velocity_threshold: float = 0.12,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
+) -> torch.Tensor:
+    """Penalize both feet being on the ground for too long.
+
+    当机器人有速度指令时，如果双脚同时着地的时间超过 max_grounded_time，
+    施加线性惩罚。这迫使机器人加快步频，而不是慢慢迈大步。
+
+    amp_roban_share 的 turning_step_frequency 使用 max_grounded_time=0.2s。
+
+    返回负值（惩罚），需要配合负权重或反转权重使用。
+    注意：返回的是负值惩罚，配合 **正** weight 使用。
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    # 检测双脚是否都在地面
+    net_forces = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+    in_contact = net_forces.norm(dim=-1).max(dim=1)[0] > 1.0  # [batch, 2]
+    both_feet_grounded = torch.all(in_contact, dim=1)  # [batch]
+
+    # 维护双脚着地时间计数器
+    if not hasattr(env, "_both_feet_grounded_time"):
+        env._both_feet_grounded_time = torch.zeros(env.num_envs, device=in_contact.device)
+
+    env._both_feet_grounded_time = torch.where(
+        both_feet_grounded,
+        env._both_feet_grounded_time + env.step_dt,
+        torch.zeros_like(env._both_feet_grounded_time),
+    )
+
+    # episode 重置时清零
+    fresh = env.episode_length_buf <= 1
+    if fresh.any():
+        env._both_feet_grounded_time[fresh] = 0
+
+    # 超过 max_grounded_time 的部分施加惩罚
+    penalty = torch.clamp(env._both_feet_grounded_time - max_grounded_time, min=0.0)
+
+    # 只在有速度指令时激活
+    has_command = (
+        torch.norm(env.command_generator.command[:, :2], dim=1)
+        + torch.abs(env.command_generator.command[:, 2])
+    ) > velocity_threshold
+
+    reward = torch.where(has_command, -penalty * penalty_scale, torch.zeros_like(penalty))
+    return reward
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Symmetry Reward Functions (for biped gait symmetry enforcement)
 # ══════════════════════════════════════════════════════════════════════════════
 
