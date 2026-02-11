@@ -283,6 +283,63 @@ def hip_roll_conditional_penalty(
     return torch.sum(torch.square(excess), dim=1)
 
 
+def hip_yaw_conditional_penalty(
+    env: BaseEnv,
+    deadzone_base: float = 0.15,
+    deadzone_max: float = 0.4,
+    vel_threshold: float = 0.5,
+    toein_deadzone_ratio: float = 0.5,
+    toein_signs: list[float] | None = None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """
+    Angular-velocity-conditioned hip yaw (L3/R3) penalty with asymmetric
+    dead zone: toe-in direction is penalized more heavily.
+
+    Dead zone expands when angular velocity command |ω_z| is large (turning),
+    and is tighter in the toe-in direction to prevent pigeon-toed posture.
+
+    Toe-in direction:
+        L3 (default=-0.287): deviation < 0 → toein_sign = -1
+        R3 (default=+0.287): deviation > 0 → toein_sign = +1
+
+    Args:
+        env: The environment instance
+        deadzone_base: Dead zone when not turning (rad)
+        deadzone_max: Dead zone when turning at full speed (rad)
+        vel_threshold: Angular velocity at which dead zone reaches maximum (rad/s)
+        toein_deadzone_ratio: Toe-in dead zone = deadzone * this ratio (< 1.0 = tighter)
+        toein_signs: Per-joint sign indicating toe-in direction, e.g. [-1.0, 1.0]
+                     for [L3, R3]. If None, penalty is symmetric.
+        asset_cfg: Scene entity configuration for hip yaw joints
+
+    Returns:
+        Quadratic penalty for deviations beyond the asymmetric dead zone
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    deviation = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+
+    # Velocity-dependent base dead zone (angular velocity)
+    ang_vel_cmd = torch.abs(env.command_generator.command[:, 2])
+    vel_ratio = torch.clamp(ang_vel_cmd / vel_threshold, max=1.0)
+    deadzone = deadzone_base + (deadzone_max - deadzone_base) * vel_ratio  # [num_envs]
+
+    # Asymmetric dead zone: tighter in toe-in direction
+    if toein_signs is not None:
+        signs = torch.tensor(toein_signs, device=asset.device, dtype=torch.float32)  # [num_joints]
+        # is_toein: True when deviation is in toe-in direction
+        is_toein = (deviation * signs.unsqueeze(0)) > 0  # [num_envs, num_joints]
+        # Toe-in gets tighter dead zone, toe-out gets normal dead zone
+        dz_expanded = deadzone.unsqueeze(1).expand_as(deviation)  # [num_envs, num_joints]
+        effective_deadzone = torch.where(is_toein, dz_expanded * toein_deadzone_ratio, dz_expanded)
+    else:
+        effective_deadzone = deadzone.unsqueeze(1)
+
+    excess = torch.abs(deviation) - effective_deadzone
+    excess = torch.clamp(excess, min=0.0)
+    return torch.sum(torch.square(excess), dim=1)
+
+
 def body_orientation_l2(
     env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -310,6 +367,40 @@ def feet_too_near_humanoid(
     feet_pos = asset.data.body_pos_w[:, asset_cfg.body_ids, :]
     distance = torch.norm(feet_pos[:, 0] - feet_pos[:, 1], dim=-1)
     return (threshold - distance).clamp(min=0)
+
+
+def feet_distance_penalty(
+    env: BaseEnv | TienKungEnv,
+    min_dist: float = 0.20,
+    max_dist: float = 0.32,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """
+    Penalize when the distance between the two feet is outside [min_dist, max_dist].
+
+    - distance < min_dist: penalty = (min_dist - distance)^2  (too close)
+    - distance > max_dist: penalty = (distance - max_dist)^2  (too far)
+    - min_dist <= distance <= max_dist: penalty = 0            (OK)
+
+    Uses 3D Euclidean distance between the two foot body positions.
+
+    Args:
+        env: The environment instance
+        min_dist: Minimum allowed distance between feet (m)
+        max_dist: Maximum allowed distance between feet (m)
+        asset_cfg: Scene entity configuration with exactly 2 body names (left/right foot)
+
+    Returns:
+        Quadratic penalty for feet distance outside the allowed range
+    """
+    assert len(asset_cfg.body_ids) == 2
+    asset: Articulation = env.scene[asset_cfg.name]
+    feet_pos = asset.data.body_pos_w[:, asset_cfg.body_ids, :]
+    distance = torch.norm(feet_pos[:, 0] - feet_pos[:, 1], dim=-1)
+
+    too_close = (min_dist - distance).clamp(min=0.0)
+    too_far = (distance - max_dist).clamp(min=0.0)
+    return torch.square(too_close) + torch.square(too_far)
 
 
 # Regularization Reward

@@ -148,11 +148,16 @@ class RobanLiteRewardCfg(LiteRewardCfg):
         },
     )
     
-    # ========== 步态周期奖励 (gait clock) ==========
-    # 摆动相：惩罚脚与地面的接触力 → 迫使机器人在该抬脚时抬脚
-    gait_feet_frc_perio = RewTerm(func=mdp.gait_feet_frc_perio, weight=3.0, params={"delta_t": 0.02})
-    # 支撑相：惩罚脚的移动速度 → 迫使机器人在该踩地时保持脚稳定
-    gait_feet_spd_perio = RewTerm(func=mdp.gait_feet_spd_perio, weight=3.0, params={"delta_t": 0.02})
+    # ========== 滞空时间奖励 ==========
+    # 奖励单脚支撑时的滞空/触地时间，鼓励交替迈步（仅有速度指令时生效）
+    feet_air_time = RewTerm(
+        func=mdp.feet_air_time_positive_biped,
+        weight=10.0,
+        params={
+            "threshold": 0.4,
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
+        },
+    )
 
     ## 以下是为了防止诡异行走而设置
 
@@ -178,6 +183,27 @@ class RobanLiteRewardCfg(LiteRewardCfg):
         },
     )
     
+    # # ========== 髋关节 Yaw (L3/R3) 防内八惩罚 ==========
+    # # L3/R3 是髋关节偏航, axis=(0,0,1), 默认值 L3=-0.287, R3=0.287
+    # # 转弯时需要较大幅度运动, 其他情况保持默认位置附近
+    # # 内八方向死区更紧: 正常方向 deadzone, 内八方向 deadzone * 0.4
+    # #   L3 内八 = 偏差<0 (toein_sign=-1), R3 内八 = 偏差>0 (toein_sign=+1)
+    # hip_yaw_penalty = RewTerm(
+    #     func=mdp.hip_yaw_conditional_penalty,
+    #     weight=-5.0,
+    #     params={
+    #         "deadzone_base": 0.2,            # 直行时的基础死区 (rad, ≈8.6°)
+    #         "deadzone_max": 0.5,              # 转弯时的最大死区 (rad, ≈28.6°)
+    #         "vel_threshold": 0.8,             # 角速度阈值 (rad/s), 达到此值死区最大
+    #         "toein_deadzone_ratio": 0.4,      # 内八方向死区 = 基础死区 × 0.4 (更严格)
+    #         "toein_signs": [-1.0, 1.0],       # L3 内八=-1, R3 内八=+1
+    #         "asset_cfg": SceneEntityCfg(
+    #             "robot",
+    #             joint_names=["leg_l3_joint", "leg_r3_joint"],
+    #         ),
+    #     },
+    # )
+    
     # ========== 膝盖 Pitch (L4/R4) 限位惩罚 ==========
     # 膝盖关节 axis=(0,1,0), 限位=[0.0, 2.618], 默认=0.5rad
     # 正常走路时膝盖在默认值附近 ±0.5rad (0.0~1.0rad) 范围内弯曲/伸展
@@ -193,6 +219,22 @@ class RobanLiteRewardCfg(LiteRewardCfg):
             ),
         },
     )
+    
+    # # ========== 两脚距离惩罚 ==========
+    # # 惩罚两脚之间 3D 距离 < 20cm（太近/交叉）或 > 32cm（太远/劈叉）
+    # # 在 [20cm, 32cm] 范围内无惩罚
+    # feet_distance = RewTerm(
+    #     func=mdp.feet_distance_penalty,
+    #     weight=-5.0,
+    #     params={
+    #         "min_dist": 0.20,  # 最小允许距离 (m)
+    #         "max_dist": 0.30,  # 最大允许距离 (m)
+    #         "asset_cfg": SceneEntityCfg(
+    #             "robot",
+    #             body_names=["leg_l6_link", "leg_r6_link"],
+    #         ),
+    #     },
+    # )
 
 
 @configclass
@@ -380,6 +422,6 @@ class RobanWalkAgentCfg(RslRlOnPolicyRunnerCfg):
     # 新奖励组合参数（与 amp_roban_share 一致）
     task_reward_weight = 1.0              # Task 奖励权重（对应 amp_roban_share 的 task_reward_weight）
     style_reward_weight = 0.02            # AMP 风格奖励权重（对应 amp_roban_share 的 style_reward_weight）
-    discriminator_reward_scale = 2.0      # 判别器奖励缩放（对应 amp_roban_share 的 discriminator_reward_scale）
+    discriminator_reward_scale = 5.0      # 判别器奖励缩放（对应 amp_roban_share 的 discriminator_reward_scale）
     # 最终奖励 = 1.0 * task_reward + 0.02 * (discriminator_reward_scale * style_reward)
     # AMP 贡献最大 = 0.02 * 2.0 = 0.04（当 style_reward = 1.0 时）
