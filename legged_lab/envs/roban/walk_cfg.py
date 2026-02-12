@@ -56,6 +56,57 @@ class GaitCfg:
 
 
 @configclass
+class VelocityCurriculumCfg:
+    """速度指令课程学习配置。
+
+    训练开始时只给小速度指令（先学慢走），随着策略稳定后逐步扩大速度范围。
+
+    升级条件（必须同时满足）：
+      1. 平均 episode 长度 > promote_threshold × max_episode_length
+      2. 平均线速度跟踪误差 < promote_lin_vel_err_limit
+      3. 平均角速度跟踪误差 < promote_ang_vel_err_limit
+    这避免了"站桩生存偏差"——机器人站着不动也能升级的问题。
+
+    降级条件：平均 episode 长度 < demote_threshold × max_episode_length
+
+    冷却机制：级别变更后，缓冲区中残留着旧级别指令下的数据。
+    通过 cooldown_steps 忽略掉在旧级别下开始的 episode，避免"火箭跳级"。
+    """
+    enable: bool = True
+
+    # ── 升/降级阈值 ──
+    promote_threshold: float = 0.75  # 平均能走 75% 最大时长 → 升级
+    demote_threshold: float = 0.35   # 平均只能走 35% → 降级
+
+    # ── 跟踪误差限制（防止站桩生存偏差）──
+    promote_lin_vel_err_limit: float = 0.2   # m/s，线速度 RMSE 上限
+    promote_ang_vel_err_limit: float = 0.2   # rad/s，角速度 RMSE 上限
+
+    # ── 统计缓冲区 ──
+    buffer_size: int = 2000  # 大规模并行环境需要更大的样本量
+
+    # ── 冷却机制 ──
+    # 级别变更后，忽略在旧级别下启动的 episode（单位：env steps）
+    cooldown_steps: int = 500
+
+    # ── 各级别的速度范围 ──
+    levels: list = None
+
+    def __post_init__(self):
+        if self.levels is None:
+            self.levels = [
+                # Level 0: 只前进慢走，几乎不转弯
+                {"lin_vel_x": (0.0, 0.3), "lin_vel_y": (-0.1, 0.1), "ang_vel_z": (-0.3, 0.3)},
+                # Level 1: 加入后退和中速
+                {"lin_vel_x": (-0.2, 0.5), "lin_vel_y": (-0.2, 0.2), "ang_vel_z": (-0.8, 0.8)},
+                # Level 2: 接近完整范围
+                {"lin_vel_x": (-0.4, 0.8), "lin_vel_y": (-0.3, 0.3), "ang_vel_z": (-1.2, 1.2)},
+                # Level 3: 完整范围
+                {"lin_vel_x": (-0.6, 1.0), "lin_vel_y": (-0.5, 0.5), "ang_vel_z": (-1.57, 1.57)},
+            ]
+
+
+@configclass
 class LiteRewardCfg:
     """简化的奖励配置，与kuavo对应"""
     # 速度跟踪 (对应kuavo: tracking_lin_vel=1.2, tracking_ang_vel=1.1)
@@ -373,6 +424,7 @@ class RobanWalkFlatEnvCfg:
             lin_vel_x=(-0.6, 1.0), lin_vel_y=(-0.5, 0.5), ang_vel_z=(-1.57, 1.57), heading=(-math.pi, math.pi)
         ),
     )
+    velocity_curriculum: VelocityCurriculumCfg = VelocityCurriculumCfg()
     noise: NoiseCfg = NoiseCfg(
         add_noise=True,
         noise_scales=NoiseScalesCfg(

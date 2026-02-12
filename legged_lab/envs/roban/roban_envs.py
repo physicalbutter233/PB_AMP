@@ -27,7 +27,10 @@ from isaaclab.managers.scene_entity_cfg import SceneEntityCfg
 from isaaclab.scene import InteractiveScene
 from isaaclab.sensors import ContactSensor
 from isaaclab.sim import PhysxCfg, SimulationContext
+from collections import deque
+
 from isaaclab.utils.buffers import CircularBuffer, DelayBuffer
+import isaaclab.utils.math as math_utils
 from isaaclab.utils.math import quat_apply, quat_conjugate, quat_rotate
 from scipy.spatial.transform import Rotation
 
@@ -93,6 +96,9 @@ class RobanEnv(VecEnv):
         self.reward_manager = RewardManager(self.cfg.reward, self)
 
         self.init_buffers()
+
+        # ── 速度课程学习初始化（必须在 reset 之前，reset 会调用 _update_velocity_curriculum）──
+        self._init_velocity_curriculum()
 
         env_ids = torch.arange(self.num_envs, device=self.device)
         self.event_manager = EventManager(self.cfg.domain_rand.events, self)
@@ -470,7 +476,12 @@ class RobanEnv(VecEnv):
         self.avg_feet_force_per_step[env_ids] = 0.0
         self.avg_feet_speed_per_step[env_ids] = 0.0
 
+        # ── 速度课程学习 ──
+        vel_cur_extras = self._update_velocity_curriculum(env_ids)
+
         self.extras["log"] = dict()
+        if vel_cur_extras:
+            self.extras["log"].update(vel_cur_extras)
         if self.cfg.scene.terrain_generator is not None:
             if self.cfg.scene.terrain_generator.curriculum:
                 terrain_levels = self.update_terrain_levels(env_ids)
@@ -535,6 +546,10 @@ class RobanEnv(VecEnv):
         if "interval" in self.event_manager.available_modes:
             self.event_manager.apply(mode="interval", dt=self.step_dt)
 
+        # ── 累积速度跟踪误差（供课程学习使用）──
+        if self._vel_curriculum_enabled:
+            self._accumulate_tracking_error()
+
         self.reset_buf, self.time_out_buf = self.check_reset()
         reward_buf = self.reward_manager.compute(self.step_dt)
         self.reset_env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
@@ -586,6 +601,171 @@ class RobanEnv(VecEnv):
         self.critic_obs_buffer = CircularBuffer(
             max_len=self.cfg.robot.critic_obs_history_length, batch_size=self.num_envs, device=self.device
         )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Velocity Curriculum Learning
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _init_velocity_curriculum(self):
+        """初始化速度课程学习状态。"""
+        cur_cfg = getattr(self.cfg, "velocity_curriculum", None)
+        self._vel_curriculum_enabled = cur_cfg is not None and getattr(cur_cfg, "enable", False)
+        if not self._vel_curriculum_enabled:
+            return
+
+        self._vel_cur_cfg = cur_cfg
+        self._vel_cur_level = 0
+        self._vel_cur_max_level = len(cur_cfg.levels) - 1
+
+        # 统计缓冲区：episode 长度 + 跟踪误差
+        self._vel_cur_ep_lengths = deque(maxlen=cur_cfg.buffer_size)
+        self._vel_cur_ep_lin_errs = deque(maxlen=cur_cfg.buffer_size)
+        self._vel_cur_ep_ang_errs = deque(maxlen=cur_cfg.buffer_size)
+
+        # 每步跟踪误差累积器（per-env）
+        self._vel_cur_lin_err_acc = torch.zeros(self.num_envs, device=self.device)
+        self._vel_cur_ang_err_acc = torch.zeros(self.num_envs, device=self.device)
+
+        # 冷却机制：记录级别变更时的 env-step 时间戳
+        # 只有在该时间戳之后才开始的 episode 才会被记录
+        self._vel_cur_level_change_step = 0  # 初始时为 0，所有 episode 都有效
+
+        # 应用初始级别（Level 0）
+        self._apply_velocity_level(0)
+        print(f"[VelocityCurriculum] 已启用，共 {len(cur_cfg.levels)} 级")
+        print(f"  Level 0: {cur_cfg.levels[0]}")
+        print(f"  promote: ep>{cur_cfg.promote_threshold*100:.0f}%max "
+              f"AND lin_err<{cur_cfg.promote_lin_vel_err_limit}m/s "
+              f"AND ang_err<{cur_cfg.promote_ang_vel_err_limit}rad/s")
+
+    def _apply_velocity_level(self, level: int):
+        """将指定级别的速度范围写入 command_generator。"""
+        ranges = self._vel_cur_cfg.levels[level]
+        cmd_ranges = self.command_generator.cfg.ranges
+        cmd_ranges.lin_vel_x = tuple(ranges["lin_vel_x"])
+        cmd_ranges.lin_vel_y = tuple(ranges["lin_vel_y"])
+        cmd_ranges.ang_vel_z = tuple(ranges["ang_vel_z"])
+
+    def _accumulate_tracking_error(self):
+        """每个 env step 调用，累积线速度和角速度跟踪误差。
+
+        在 step() 中调用，用于在 episode 结束时计算平均跟踪误差。
+        """
+        # 线速度误差：在 yaw frame 下计算 ||cmd_xy - vel_xy||
+        vel_yaw = math_utils.quat_rotate_inverse(
+            math_utils.yaw_quat(self.robot.data.root_quat_w),
+            self.robot.data.root_lin_vel_w[:, :3],
+        )
+        lin_err = torch.norm(
+            self.command_generator.command[:, :2] - vel_yaw[:, :2], dim=1
+        )
+        # 角速度误差：|cmd_yaw - actual_yaw_rate|
+        ang_err = torch.abs(
+            self.command_generator.command[:, 2] - self.robot.data.root_ang_vel_w[:, 2]
+        )
+
+        self._vel_cur_lin_err_acc += lin_err
+        self._vel_cur_ang_err_acc += ang_err
+
+    def _update_velocity_curriculum(self, env_ids) -> dict:
+        """在 reset 时调用，记录 episode 统计并判断是否升/降级。
+
+        改进点（相比原版）：
+        1. 防止站桩升级：升级需要同时满足 episode 长度 + 跟踪误差两个条件
+        2. 冷却机制：级别变更后，忽略在旧级别下开始的 episode
+        3. 更大的缓冲区：默认 2000（适配大规模并行环境）
+        """
+        if not self._vel_curriculum_enabled:
+            return {}
+
+        # 当前全局 env step（不是 sim step）
+        global_env_step = self.sim_step_counter // self.cfg.sim.decimation
+
+        # ── 记录刚结束的 episode 统计（附冷却过滤）──
+        ep_lengths = self.episode_length_buf[env_ids]  # 刚结束的 episode 长度（steps）
+        for i, env_id in enumerate(env_ids):
+            ep_len = ep_lengths[i].item()
+            if ep_len <= 0:
+                continue  # 排除初始 reset
+
+            # 冷却过滤：该 episode 是否在新级别生效之后才开始？
+            episode_start_step = global_env_step - ep_len
+            if episode_start_step < self._vel_cur_level_change_step:
+                # 该 episode 在旧级别下启动，丢弃（避免数据滞后）
+                continue
+
+            ep_length_s = ep_len * self.step_dt
+            # 计算该 episode 的平均跟踪误差（RMSE 近似：累积值 / 步数）
+            mean_lin_err = self._vel_cur_lin_err_acc[env_id].item() / max(ep_len, 1)
+            mean_ang_err = self._vel_cur_ang_err_acc[env_id].item() / max(ep_len, 1)
+
+            self._vel_cur_ep_lengths.append(ep_length_s)
+            self._vel_cur_ep_lin_errs.append(mean_lin_err)
+            self._vel_cur_ep_ang_errs.append(mean_ang_err)
+
+        # ── 重置已结束 episode 的累积器 ──
+        self._vel_cur_lin_err_acc[env_ids] = 0
+        self._vel_cur_ang_err_acc[env_ids] = 0
+
+        # ── 检查是否有足够样本做决策 ──
+        min_samples = self._vel_cur_cfg.buffer_size // 4
+        if len(self._vel_cur_ep_lengths) < min_samples:
+            return {
+                "Curriculum/velocity_level": float(self._vel_cur_level),
+            }
+
+        # ── 计算统计量 ──
+        mean_ep_length = sum(self._vel_cur_ep_lengths) / len(self._vel_cur_ep_lengths)
+        mean_lin_err = sum(self._vel_cur_ep_lin_errs) / len(self._vel_cur_ep_lin_errs)
+        mean_ang_err = sum(self._vel_cur_ep_ang_errs) / len(self._vel_cur_ep_ang_errs)
+
+        promote_thresh = self._vel_cur_cfg.promote_threshold * self.max_episode_length_s
+        demote_thresh = self._vel_cur_cfg.demote_threshold * self.max_episode_length_s
+        lin_err_limit = self._vel_cur_cfg.promote_lin_vel_err_limit
+        ang_err_limit = self._vel_cur_cfg.promote_ang_vel_err_limit
+
+        # ── 升级判断（需同时满足：存活时间 + 跟踪精度）──
+        if (
+            self._vel_cur_level < self._vel_cur_max_level
+            and mean_ep_length > promote_thresh
+            and mean_lin_err < lin_err_limit
+            and mean_ang_err < ang_err_limit
+        ):
+            self._vel_cur_level += 1
+            self._apply_velocity_level(self._vel_cur_level)
+            # 清空缓冲区 + 设置冷却时间戳
+            self._vel_cur_ep_lengths.clear()
+            self._vel_cur_ep_lin_errs.clear()
+            self._vel_cur_ep_ang_errs.clear()
+            self._vel_cur_level_change_step = global_env_step + self._vel_cur_cfg.cooldown_steps
+            print(
+                f"[VelocityCurriculum] ↑ 升级到 Level {self._vel_cur_level}: "
+                f"{self._vel_cur_cfg.levels[self._vel_cur_level]}  "
+                f"(ep={mean_ep_length:.1f}s>{promote_thresh:.1f}s, "
+                f"lin_err={mean_lin_err:.3f}<{lin_err_limit}, "
+                f"ang_err={mean_ang_err:.3f}<{ang_err_limit})"
+            )
+
+        # ── 降级判断（只看存活时间，摔太多就降级）──
+        elif self._vel_cur_level > 0 and mean_ep_length < demote_thresh:
+            self._vel_cur_level -= 1
+            self._apply_velocity_level(self._vel_cur_level)
+            self._vel_cur_ep_lengths.clear()
+            self._vel_cur_ep_lin_errs.clear()
+            self._vel_cur_ep_ang_errs.clear()
+            self._vel_cur_level_change_step = global_env_step + self._vel_cur_cfg.cooldown_steps
+            print(
+                f"[VelocityCurriculum] ↓ 降级到 Level {self._vel_cur_level}: "
+                f"{self._vel_cur_cfg.levels[self._vel_cur_level]}  "
+                f"(ep={mean_ep_length:.1f}s<{demote_thresh:.1f}s)"
+            )
+
+        return {
+            "Curriculum/velocity_level": float(self._vel_cur_level),
+            "Curriculum/mean_episode_length": mean_ep_length,
+            "Curriculum/mean_lin_vel_error": mean_lin_err,
+            "Curriculum/mean_ang_vel_error": mean_ang_err,
+        }
 
     def update_terrain_levels(self, env_ids):
         distance = torch.norm(self.robot.data.root_pos_w[env_ids, :2] - self.scene.env_origins[env_ids, :2], dim=1)
