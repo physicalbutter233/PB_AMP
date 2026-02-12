@@ -514,8 +514,163 @@ def gait_feet_frc_support_perio(env: TienKungEnv, delta_t: float = 0.02) -> torc
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Natural Landing Rewards
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def contact_ground_straight_knee(
+    env: BaseEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    std: float = 0.1,
+) -> torch.Tensor:
+    """Reward straight (extended) knees at the moment of touchdown.
+
+    人类自然行走时，落地腿膝盖是接近伸直的。如果机器人弯着膝盖落地，
+    往往伴随重心下沉、步态不稳、步幅过大等问题。
+
+    仅在 first_contact（着地瞬间）给出奖励：
+        reward = exp(-knee_pos² / std²) * first_contact
+
+    knee_pos 使用原始关节角度（非相对于 default）。
+    对于 Roban S14，knee 关节范围 [0, 2.618]，0=完全伸直。
+    所以 knee_pos 越接近 0，奖励越大。
+
+    amp_roban_share 参考值：weight=1.0, std=0.3
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    first_contact = contact_sensor.compute_first_contact(env.step_dt)[:, sensor_cfg.body_ids]  # [batch, 2]
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_idxs = asset.find_joints(asset_cfg.joint_names)[0]
+
+    # exp(-q²/σ²): 膝盖越伸直(q→0)奖励越大
+    straight_knee = torch.exp(-torch.square(asset.data.joint_pos[:, joint_idxs] / std))
+    straight_knee = straight_knee * first_contact  # 只在着地瞬间
+
+    reward = torch.sum(straight_knee, dim=1)
+    # 只在有速度指令时激活
+    has_command = (
+        torch.norm(env.command_generator.command[:, :2], dim=1)
+        + torch.abs(env.command_generator.command[:, 2])
+    ) > 0.1
+    return reward * has_command
+
+
+def contact_momentum(
+    env: BaseEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    std: float = 0.05,
+) -> torch.Tensor:
+    """Reward gentle (low vertical velocity) foot landing.
+
+    着地瞬间脚部的垂直速度应该尽量小。砸地式落脚会产生冲击，
+    不利于稳定行走，也不自然。
+
+    仅在 first_contact 时给出奖励：
+        reward = exp(-(v_z)² / std²) * first_contact
+
+    v_z 被 clamp 到 [-10, 0]（只关注下落方向）。
+    v_z ≈ 0 时奖励最大（轻柔落地）。
+
+    amp_roban_share 参考值：weight=1.0(?), std=0.05
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    first_contact = contact_sensor.compute_first_contact(env.step_dt)[:, sensor_cfg.body_ids]  # [batch, 2]
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    # 脚部垂直速度（世界坐标系 z 方向）
+    body_vel_z = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, 2]  # [batch, 2]
+    # 只关注下落方向（负速度）
+    body_vel_z = torch.clamp(body_vel_z, min=-10.0, max=0.0)
+
+    reward = torch.exp(-torch.square(body_vel_z / std)) * first_contact
+
+    result = torch.sum(reward, dim=1)
+    # 只在有速度指令时激活
+    has_command = (
+        torch.norm(env.command_generator.command[:, :2], dim=1)
+        + torch.abs(env.command_generator.command[:, 2])
+    ) > 0.1
+    return result * has_command
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Stride / Step Frequency Control Rewards
 # ══════════════════════════════════════════════════════════════════════════════
+
+
+def feet_height_cycle(
+    env: BaseEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    max_height_clip: float = 0.15,
+) -> torch.Tensor:
+    """Reward foot swing height per cycle, triggered only at touchdown.
+
+    每个摆动周期只奖励一次：该周期中脚达到的**最大离地高度**。
+    仅在脚刚着地（first_contact）的那一步触发奖励，其余步为 0。
+    高度 clip 到 max_height_clip 防止过高抬脚。
+
+    逻辑：
+    1. 脚在空中时：持续更新该脚本周期的最大高度
+    2. 脚刚着地时：输出该最大高度作为奖励，然后重置缓存
+    3. 脚在地面时：奖励为 0（不重复给）
+
+    效果：
+    - 鼓励抬脚（避免拖地/擦地）
+    - max_height_clip=0.15 限制抬脚上限（防止大幅甩腿导致大跨步）
+    - 配合 step_frequency_penalty 一起使用效果最佳
+
+    amp_roban_share 参考值：weight=12.0, max_height_clip=0.15
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    # 当前脚的世界坐标 z（离地高度）
+    feet_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]  # [batch, 2]
+    feet_height = torch.nan_to_num(feet_height, nan=0.0, posinf=0.1, neginf=0.0)
+
+    # 是否在接触地面
+    in_contact = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2] > 10.0  # [batch, 2]
+    # 本步是否刚着地
+    first_contact = contact_sensor.compute_first_contact(env.step_dt)[:, sensor_cfg.body_ids]  # [batch, 2]
+
+    # ── 初始化周期最大高度缓存 ──
+    if not hasattr(env, "_feet_cycle_max_height"):
+        env._feet_cycle_max_height = torch.zeros_like(feet_height)
+
+    # ── episode 重置时清零 ──
+    fresh = env.episode_length_buf <= 1
+    if fresh.any():
+        env._feet_cycle_max_height[fresh] = 0
+
+    # ── 脚在空中 → 更新本周期最大高度 ──
+    not_in_contact = ~in_contact
+    env._feet_cycle_max_height = torch.where(
+        not_in_contact,
+        torch.maximum(env._feet_cycle_max_height, feet_height),
+        env._feet_cycle_max_height,
+    )
+
+    # ── 刚着地 → 输出奖励 ──
+    reward = torch.where(
+        first_contact,
+        env._feet_cycle_max_height,
+        torch.zeros_like(feet_height),
+    )
+
+    # ── 刚着地 → 重置缓存（为下一个摆动周期准备）──
+    env._feet_cycle_max_height = torch.where(
+        first_contact,
+        torch.zeros_like(env._feet_cycle_max_height),
+        env._feet_cycle_max_height,
+    )
+
+    # 双脚求和，clip 上界
+    reward = torch.sum(torch.clamp(reward, max=max_height_clip), dim=1)
+    return reward
 
 
 def feet_air_time_clip_biped(

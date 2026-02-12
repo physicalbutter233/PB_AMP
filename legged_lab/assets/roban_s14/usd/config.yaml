@@ -1,5 +1,5 @@
-asset_path: /home/kyxmb/mkh/AMP/PB_AMP/legged_lab/assets/roban_s14/urdf/biped_s14.urdf
-usd_dir: /home/kyxmb/mkh/AMP/PB_AMP/legged_lab/assets/roban_s14/usd
+asset_path: legged_lab/assets/roban_s14/urdf/biped_s14.urdf
+usd_dir: legged_lab/assets/roban_s14/usd
 usd_file_name: biped_s14.usd
 force_usd_conversion: true
 make_instanceable: true

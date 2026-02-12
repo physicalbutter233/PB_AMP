@@ -154,7 +154,7 @@ class RobanLiteRewardCfg(LiteRewardCfg):
     # threshold_max=0.3: 超过 0.3s 不再有额外奖励（防大跨步）
     feet_air_time = RewTerm(
         func=mdp.feet_air_time_clip_biped,
-        weight=10.0,
+        weight=20.0,
         params={
             "threshold_min": 0.25,
             "threshold_max": 0.4,
@@ -176,6 +176,43 @@ class RobanLiteRewardCfg(LiteRewardCfg):
         },
     )
 
+    # ========== 抬脚高度奖励 ==========
+    # 每个摆动周期只在着地瞬间奖励一次，奖励该周期的最大抬脚高度
+    # max_height_clip=0.15: 超过 15cm 不再有额外奖励（防止甩腿过高→大跨步）
+    # amp_roban_share 参考值：weight=12.0, max_height_clip=0.15
+    feet_height = RewTerm(
+        func=mdp.feet_height_cycle,
+        weight=12.0,
+        params={
+            "max_height_clip": 0.15,
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
+            "asset_cfg": SceneEntityCfg("robot", body_names=["leg_l6_link", "leg_r6_link"]),
+        },
+    )
+
+    # ========== 自然落地奖励 ==========
+    # 着地瞬间膝盖伸直（人类走路落地腿近乎伸直）
+    straight_knee_landing = RewTerm(
+        func=mdp.contact_ground_straight_knee,
+        weight=15.0,
+        params={
+            "std": 0.3,
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
+            "asset_cfg": SceneEntityCfg("robot", joint_names=["leg_l4_joint", "leg_r4_joint"]),
+        },
+    )
+
+    # 着地瞬间脚部垂直速度小（轻柔落地，不砸地）
+    soft_landing = RewTerm(
+        func=mdp.contact_momentum,
+        weight=1.0,
+        params={
+            "std": 0.05,
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
+            "asset_cfg": SceneEntityCfg("robot", body_names=["leg_l6_link", "leg_r6_link"]),
+        },
+    )
+
     ## 以下是为了防止诡异行走而设置
 
     
@@ -184,21 +221,21 @@ class RobanLiteRewardCfg(LiteRewardCfg):
     # L2/R2 (roll, 轴=X) 在正常前后行走时不需要补偿 L1 的运动.
     # 因此可以较严格地约束 L2/R2, 防止双腿诡异岔开.
     #
-    # 速度条件版本: 前向行走时 deadzone=0.1rad(约5.7°),
-    # 侧向行走时自动放宽到 0.3rad(约17.2°)
-    hip_roll_penalty = RewTerm(
-        func=mdp.hip_roll_conditional_penalty,
-        weight=-5.0,
-        params={
-            "deadzone_base": 0.2,    # 前向行走时的死区 (rad)
-            "deadzone_max": 0.4,     # 侧向行走时的死区 (rad)
-            "vel_threshold": 0.3,    # 侧向速度阈值 (m/s)
-            "asset_cfg": SceneEntityCfg(
-                "robot",
-                joint_names=["leg_l2_joint", "leg_r2_joint"],
-            ),
-        },
-    )
+    # # 速度条件版本: 前向行走时 deadzone=0.1rad(约5.7°),
+    # # 侧向行走时自动放宽到 0.3rad(约17.2°)
+    # hip_roll_penalty = RewTerm(
+    #     func=mdp.hip_roll_conditional_penalty,
+    #     weight=-5.0,
+    #     params={
+    #         "deadzone_base": 0.2,    # 前向行走时的死区 (rad)
+    #         "deadzone_max": 0.4,     # 侧向行走时的死区 (rad)
+    #         "vel_threshold": 0.3,    # 侧向速度阈值 (m/s)
+    #         "asset_cfg": SceneEntityCfg(
+    #             "robot",
+    #             joint_names=["leg_l2_joint", "leg_r2_joint"],
+    #         ),
+    #     },
+    # )
     
     # # ========== 髋关节 Yaw (L3/R3) 防内八惩罚 ==========
     # # L3/R3 是髋关节偏航, axis=(0,0,1), 默认值 L3=-0.287, R3=0.287
@@ -242,9 +279,9 @@ class RobanLiteRewardCfg(LiteRewardCfg):
     # 在 [20cm, 32cm] 范围内无惩罚
     feet_distance = RewTerm(
         func=mdp.feet_distance_penalty,
-        weight=-5.0,
+        weight=-30.0,
         params={
-            "min_dist": 0.20,  # 最小允许距离 (m)
+            "min_dist": 0.22,  # 最小允许距离 (m)
             "max_dist": 0.30,  # 最大允许距离 (m)
             "asset_cfg": SceneEntityCfg(
                 "robot",
@@ -281,7 +318,7 @@ class RobanLiteRewardCfg(LiteRewardCfg):
 
 @configclass
 class RobanWalkFlatEnvCfg:
-    amp_motion_files_display = ["/home/kyxmb/mkh/AMP/PB_AMP/legged_lab/envs/roban/datasets/motion_visualization/walk_pb_easy_nowrist.txt"]
+    amp_motion_files_display = ["legged_lab/envs/roban/datasets/motion_visualization/walk_pb_easy_nowrist.txt"]
     amp_num_joints = 21  # Roban no-wrist: waist(1)+legs(12)+arms(8)=21
     device: str = "cuda:0"
     scene: BaseSceneCfg = BaseSceneCfg(
