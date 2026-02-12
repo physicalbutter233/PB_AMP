@@ -550,6 +550,11 @@ class RobanEnv(VecEnv):
         if self._vel_curriculum_enabled:
             self._accumulate_tracking_error()
 
+        # ── 统一死区（Unified Deadband）──
+        # 计算 is_command_active，供步态奖励门控和 stand_still_penalty 使用。
+        # 必须在 reward_manager.compute() 之前计算，因为奖励函数会读取此属性。
+        self._compute_command_deadband()
+
         self.reset_buf, self.time_out_buf = self.check_reset()
         reward_buf = self.reward_manager.compute(self.step_dt)
         self.reset_env_ids = self.reset_buf.nonzero(as_tuple=False).flatten()
@@ -563,6 +568,7 @@ class RobanEnv(VecEnv):
     def check_reset(self):
         net_contact_forces = self.contact_sensor.data.net_forces_w_history
 
+        # 接触力终止（仅 base_link 碰地）
         reset_buf = torch.any(
             torch.max(
                 torch.norm(
@@ -574,6 +580,13 @@ class RobanEnv(VecEnv):
             > 1.0,
             dim=1,
         )
+
+        # 与 amp_roban_share 一致：根部高度低于阈值时终止（真正摔倒）
+        min_height = getattr(self.cfg.robot, "terminate_min_height", 0.0)
+        if min_height > 0.0:
+            root_height = self.robot.data.root_pos_w[:, 2]
+            reset_buf |= root_height < min_height
+
         time_out_buf = self.episode_length_buf >= self.max_episode_length
         reset_buf |= time_out_buf
         return reset_buf, time_out_buf
@@ -600,6 +613,31 @@ class RobanEnv(VecEnv):
         )
         self.critic_obs_buffer = CircularBuffer(
             max_len=self.cfg.robot.critic_obs_history_length, batch_size=self.num_envs, device=self.device
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Unified Deadband Logic
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _compute_command_deadband(self):
+        """计算统一死区 mask: is_command_active。
+
+        指令"有效"的条件（OR 逻辑）：
+          ||cmd_xy|| > lin_vel_deadband  OR  |cmd_yaw| > ang_vel_deadband
+
+        效果：
+          - is_command_active = True  → 步态奖励正常生效
+          - is_command_active = False → 步态奖励归零 + stand_still_penalty 生效
+        """
+        cur_cfg = getattr(self.cfg, "velocity_curriculum", None)
+        lin_db = getattr(cur_cfg, "lin_vel_deadband", 0.2) if cur_cfg else 0.2
+        ang_db = getattr(cur_cfg, "ang_vel_deadband", 0.2) if cur_cfg else 0.2
+
+        cmd = self.command_generator.command
+        self.is_command_active = (
+            torch.norm(cmd[:, :2], dim=1) > lin_db
+        ) | (
+            torch.abs(cmd[:, 2]) > ang_db
         )
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -640,11 +678,20 @@ class RobanEnv(VecEnv):
 
         # 应用初始级别（Level 0）— 同时更新速度范围和奖励权重
         self._apply_velocity_level(0)
-        print(f"[VelocityCurriculum] 已启用，共 {len(cur_cfg.levels)} 级")
-        print(f"  Level 0: {cur_cfg.levels[0]}")
-        print(f"  promote: ep>{cur_cfg.promote_threshold*100:.0f}%max "
-              f"AND lin_err<{cur_cfg.promote_lin_vel_err_limit}m/s "
-              f"AND ang_err<{cur_cfg.promote_ang_vel_err_limit}rad/s")
+
+        # ── 启动信息 ──
+        print(f"[VelocityCurriculum] Pragmatic Natural Walking — {len(cur_cfg.levels)} 级")
+        level_names = {0: "Ignition", 1: "Steering", 2: "Omni & Refinement"}
+        for i, lv in enumerate(cur_cfg.levels):
+            name = level_names.get(i, f"Level {i}")
+            print(f"  Level {i} ({name}): {lv}")
+        print(f"  promote_threshold: ep > {cur_cfg.promote_threshold*100:.0f}% max_episode_length")
+        print(f"  demote_threshold:  ep < {cur_cfg.demote_threshold*100:.0f}% max_episode_length")
+        criteria_list = getattr(cur_cfg, "promote_criteria", None)
+        if criteria_list:
+            for i, c in enumerate(criteria_list):
+                print(f"  L{i}→L{i+1} criteria: {c}")
+        print(f"  Deadband: lin_vel={cur_cfg.lin_vel_deadband}m/s, ang_vel={cur_cfg.ang_vel_deadband}rad/s")
         if getattr(cur_cfg, "reward_multipliers", None):
             print(f"  [DynamicRewardScaling] Level 0 multipliers: {cur_cfg.reward_multipliers[0]}")
 
@@ -760,16 +807,23 @@ class RobanEnv(VecEnv):
 
         promote_thresh = self._vel_cur_cfg.promote_threshold * self.max_episode_length_s
         demote_thresh = self._vel_cur_cfg.demote_threshold * self.max_episode_length_s
-        lin_err_limit = self._vel_cur_cfg.promote_lin_vel_err_limit
-        ang_err_limit = self._vel_cur_cfg.promote_ang_vel_err_limit
 
-        # ── 升级判断（需同时满足：存活时间 + 跟踪精度）──
-        if (
-            self._vel_cur_level < self._vel_cur_max_level
-            and mean_ep_length > promote_thresh
-            and mean_lin_err < lin_err_limit
-            and mean_ang_err < ang_err_limit
-        ):
+        # ── 升级判断（per-level 条件 + 存活时间）──
+        # 使用 promote_criteria[current_level] 获取当前级别的升级误差上限。
+        # 缺失的 key 不检查（等价于 +inf）。
+        criteria_list = getattr(self._vel_cur_cfg, "promote_criteria", None)
+        can_promote = self._vel_cur_level < self._vel_cur_max_level and mean_ep_length > promote_thresh
+        if can_promote and criteria_list and self._vel_cur_level < len(criteria_list):
+            criteria = criteria_list[self._vel_cur_level]
+            lin_limit = criteria.get("lin_vel_err_limit", float("inf"))
+            ang_limit = criteria.get("ang_vel_err_limit", float("inf"))
+            can_promote = mean_lin_err < lin_limit and mean_ang_err < ang_limit
+        elif can_promote:
+            # 无 promote_criteria 配置时，不额外检查误差（向后兼容）
+            lin_limit = float("inf")
+            ang_limit = float("inf")
+
+        if can_promote:
             self._vel_cur_level += 1
             self._apply_velocity_level(self._vel_cur_level)
             # 清空缓冲区 + 设置冷却时间戳
@@ -777,12 +831,13 @@ class RobanEnv(VecEnv):
             self._vel_cur_ep_lin_errs.clear()
             self._vel_cur_ep_ang_errs.clear()
             self._vel_cur_level_change_step = global_env_step + self._vel_cur_cfg.cooldown_steps
+            level_names = {0: "Ignition", 1: "Steering", 2: "Omni"}
+            lv_name = level_names.get(self._vel_cur_level, f"Level {self._vel_cur_level}")
             print(
-                f"[VelocityCurriculum] ↑ 升级到 Level {self._vel_cur_level}: "
+                f"[VelocityCurriculum] ↑ 升级到 Level {self._vel_cur_level} ({lv_name}): "
                 f"{self._vel_cur_cfg.levels[self._vel_cur_level]}  "
                 f"(ep={mean_ep_length:.1f}s>{promote_thresh:.1f}s, "
-                f"lin_err={mean_lin_err:.3f}<{lin_err_limit}, "
-                f"ang_err={mean_ang_err:.3f}<{ang_err_limit})"
+                f"lin_err={mean_lin_err:.3f}, ang_err={mean_ang_err:.3f})"
             )
 
         # ── 降级判断（只看存活时间，摔太多就降级）──
@@ -793,8 +848,10 @@ class RobanEnv(VecEnv):
             self._vel_cur_ep_lin_errs.clear()
             self._vel_cur_ep_ang_errs.clear()
             self._vel_cur_level_change_step = global_env_step + self._vel_cur_cfg.cooldown_steps
+            level_names = {0: "Ignition", 1: "Steering", 2: "Omni"}
+            lv_name = level_names.get(self._vel_cur_level, f"Level {self._vel_cur_level}")
             print(
-                f"[VelocityCurriculum] ↓ 降级到 Level {self._vel_cur_level}: "
+                f"[VelocityCurriculum] ↓ 降级到 Level {self._vel_cur_level} ({lv_name}): "
                 f"{self._vel_cur_cfg.levels[self._vel_cur_level]}  "
                 f"(ep={mean_ep_length:.1f}s<{demote_thresh:.1f}s)"
             )
@@ -813,13 +870,14 @@ class RobanEnv(VecEnv):
         extras = {}
         if not hasattr(self, "_reward_base_weights"):
             return extras
-        # 记录关键跟踪奖励的当前有效权重，方便在 TensorBoard 中验证动态缩放是否生效
-        for name in ("track_lin_vel_xy_exp", "track_ang_vel_z_exp"):
-            if name in self._reward_base_weights:
-                current_cfg = self.reward_manager.get_term_cfg(name)
-                extras[f"Curriculum/reward_weight/{name}"] = current_cfg.weight
-        # 记录几个关键步态奖励的当前有效权重
-        for name in ("feet_air_time", "step_frequency", "feet_distance", "straight_knee_landing"):
+        # 记录关键奖励的当前有效权重，方便在 TensorBoard 中验证动态缩放是否生效
+        tracked_names = (
+            "track_lin_vel_xy_exp", "track_ang_vel_z_exp",
+            "flat_orientation_l2",
+            "feet_air_time", "step_frequency", "feet_distance",
+            "straight_knee_landing", "stand_still_penalty",
+        )
+        for name in tracked_names:
             if name in self._reward_base_weights:
                 current_cfg = self.reward_manager.get_term_cfg(name)
                 extras[f"Curriculum/reward_weight/{name}"] = current_cfg.weight

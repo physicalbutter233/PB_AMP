@@ -67,6 +67,7 @@ class RobotCfg:
     terminate_contacts_body_names: list = []
     feet_body_names: list = []
     include_gait_in_obs: bool = True  # 是否在观察值中包含步态信息
+    terminate_min_height: float = 0.0  # 根部高度低于此值时终止（0 表示不启用）
 
 
 @configclass

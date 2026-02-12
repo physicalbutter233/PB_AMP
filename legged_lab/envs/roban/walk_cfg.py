@@ -57,100 +57,98 @@ class GaitCfg:
 
 @configclass
 class VelocityCurriculumCfg:
-    """速度指令课程学习配置。
+    """Pragmatic Natural Walking 速度课程学习配置。
 
-    训练开始时只给小速度指令（先学慢走），随着策略稳定后逐步扩大速度范围。
+    设计理念："先动量，后精度"（Momentum First, Precision Later）
+    物理直觉：接近零速度时维持静态平衡比动态小跑更难。
+    因此优先解锁前进速度（动量辅助平衡），再逐步解锁转向和侧移。
 
-    升级条件（必须同时满足）：
-      1. 平均 episode 长度 > promote_threshold × max_episode_length
-      2. 平均线速度跟踪误差 < promote_lin_vel_err_limit
-      3. 平均角速度跟踪误差 < promote_ang_vel_err_limit
-    这避免了"站桩生存偏差"——机器人站着不动也能升级的问题。
+    3 阶段倒金字塔结构：
+      Level 0 (Ignition):   只前进，利用动量建立稳定步态
+      Level 1 (Steering):   解锁转向，保持步态纯度
+      Level 2 (Omni):       解锁侧移、后退、全速——最终形态
 
-    降级条件：平均 episode 长度 < demote_threshold × max_episode_length
+    每级有独立的升级条件（promote_criteria），避免一刀切阈值卡死升级。
 
-    冷却机制：级别变更后，缓冲区中残留着旧级别指令下的数据。
-    通过 cooldown_steps 忽略掉在旧级别下开始的 episode，避免"火箭跳级"。
-
-    消融实验：设置 enable=False 关闭课程（或训练时加 --no-velocity-curriculum），
-    则始终使用 commands.ranges 的完整速度范围。
+    统一死区（Unified Deadband）：
+      指令落在死区内视为"站立"，此时步态奖励归零，静止惩罚生效，
+      防止机器人被迫原地踏步。
     """
     enable: bool = True
 
-    # ── 升/降级阈值 ──
-    promote_threshold: float = 0.75  # 平均能走 75% 最大时长 → 升级
+    # ── 升/降级阈值（episode 存活率）──
+    promote_threshold: float = 0.75  # 平均能走 75% 最大时长 → 可升级
     demote_threshold: float = 0.35   # 平均只能走 35% → 降级
 
-    # ── 跟踪误差限制（防止站桩生存偏差）──
-    promote_lin_vel_err_limit: float = 0.2   # m/s，线速度 RMSE 上限
-    promote_ang_vel_err_limit: float = 0.2   # rad/s，角速度 RMSE 上限
+    # ── 每级独立的升级跟踪误差条件 ──
+    # promote_criteria[i] 定义从 Level i → Level i+1 的误差上限。
+    # 缺失的 key 不检查（等价于 +inf）。
+    # 例如 Level 0 只检查 lin_vel（还没解锁转向，不看 ang_vel）。
+    promote_criteria: list = None
 
     # ── 统计缓冲区 ──
-    buffer_size: int = 2000  # 大规模并行环境需要更大的样本量
+    buffer_size: int = 2000
 
     # ── 冷却机制 ──
-    # 级别变更后，忽略在旧级别下启动的 episode（单位：env steps）
     cooldown_steps: int = 500
 
-    # ── 各级别的速度范围 ──
+    # ── 统一死区（Unified Deadband）──
+    # 指令在死区内 → is_command_active = False → 步态奖励归零 + 静止惩罚生效
+    lin_vel_deadband: float = 0.2   # m/s, ||cmd_xy|| > 此值才算有指令
+    ang_vel_deadband: float = 0.2   # rad/s, |cmd_yaw| > 此值才算有指令
+
+    # ── 各级别的速度范围（倒金字塔）──
     levels: list = None
 
     # ── 各级别的奖励权重乘数（Level-Based Dynamic Reward Scaling）──
-    # 每个元素是一个 dict，key 为奖励名称，value 为该级别对应的乘数。
-    # 未出现在 dict 中的奖励名称默认乘数为 1.0。
-    # 目的：低级别时大幅提升速度跟踪权重、抑制步态约束，迫使机器人先学会动；
-    #       高级别时恢复原始权重，精调步态质量。
     reward_multipliers: list = None
 
     def __post_init__(self):
         if self.levels is None:
             self.levels = [
-                # Level 0: 只前进慢走，几乎不转弯
-                {"lin_vel_x": (0.0, 0.3), "lin_vel_y": (-0.1, 0.1), "ang_vel_z": (-0.3, 0.3)},
-                # Level 1: 加入后退和中速
-                {"lin_vel_x": (-0.2, 0.5), "lin_vel_y": (-0.2, 0.2), "ang_vel_z": (-0.8, 0.8)},
-                # Level 2: 接近完整范围
-                {"lin_vel_x": (-0.4, 0.8), "lin_vel_y": (-0.3, 0.3), "ang_vel_z": (-1.2, 1.2)},
-                # Level 3: 完整范围
-                {"lin_vel_x": (-0.6, 1.0), "lin_vel_y": (-0.5, 0.5), "ang_vel_z": (-1.57, 1.57)},
+                # Level 0 (Ignition): 强制进入"黄金速度区间"，动量辅助平衡
+                # lin_vel_y 锁为 0，ang_vel_z 仅允许微小噪声
+                {"lin_vel_x": (0.35, 0.6), "lin_vel_y": (0.0, 0.0), "ang_vel_z": (-0.1, 0.1)},
+                # Level 1 (Steering): 拓宽前进范围，解锁转向
+                # lin_vel_y 仍锁定，保持步态纯度
+                {"lin_vel_x": (0.25, 1.0), "lin_vel_y": (0.0, 0.0), "ang_vel_z": (-1.0, 1.0)},
+                # Level 2 (Omni & Refinement): 全方向运动——最终形态
+                {"lin_vel_x": (-0.5, 1.2), "lin_vel_y": (-0.3, 0.3), "ang_vel_z": (-1.5, 1.5)},
+            ]
+
+        if self.promote_criteria is None:
+            self.promote_criteria = [
+                # L0 → L1: 宽松，只验证"它在动"（不检查 ang_vel，还没解锁转向）
+                {"lin_vel_err_limit": 0.3},
+                # L1 → L2: 严格，必须能精确转向
+                {"lin_vel_err_limit": 0.2, "ang_vel_err_limit": 0.2},
             ]
 
         if self.reward_multipliers is None:
             self.reward_multipliers = [
-                # Level 0: 大幅提升跟踪权重 (×4)，压制步态约束 (×0.3)，迫使机器人先动起来
+                # Level 0 (Ignition): 聚焦前进，允许粗糙步态，保持身体水平
                 {
-                    "track_lin_vel_xy_exp": 4.0,
-                    "track_ang_vel_z_exp": 4.0,
-                    "feet_air_time": 0.3,
-                    "step_frequency": 0.3,
-                    "feet_distance": 0.3,
-                    "straight_knee_landing": 0.3,
-                    "feet_height": 0.3,
-                    "soft_landing": 0.3,
-                },
-                # Level 1: 跟踪权重逐步回落，步态约束逐步恢复
-                {
-                    "track_lin_vel_xy_exp": 3.0,
-                    "track_ang_vel_z_exp": 3.0,
-                    "feet_air_time": 0.5,
+                    "track_lin_vel_xy_exp": 3.0,     # 聚焦：往前走
+                    "flat_orientation_l2": 2.0,       # 保持身体水平（动量稳定必需）
+                    "feet_air_time": 0.5,             # 允许粗糙步态，别摔就行
                     "step_frequency": 0.5,
-                    "feet_distance": 0.5,
-                    "straight_knee_landing": 0.5,
                     "feet_height": 0.5,
-                    "soft_landing": 0.5,
+                    "straight_knee_landing": 0.3,     # 不急着要求落地姿态
+                    "soft_landing": 0.3,
+                    "feet_distance": 0.5,
+                    "feet_contact_time_symmetry": 0.5,
                 },
-                # Level 2: 接近原始配置
+                # Level 1 (Steering): 聚焦转向精度，开始收紧步态
                 {
                     "track_lin_vel_xy_exp": 2.0,
-                    "track_ang_vel_z_exp": 2.0,
-                    "feet_air_time": 0.75,
-                    "step_frequency": 0.75,
-                    "feet_distance": 0.75,
-                    "straight_knee_landing": 0.75,
-                    "feet_height": 0.75,
-                    "soft_landing": 0.75,
+                    "track_ang_vel_z_exp": 2.0,       # 聚焦：转向精度
+                    "feet_air_time": 0.8,             # 开始要求步态质量
+                    "step_frequency": 0.8,
+                    "feet_height": 0.8,
+                    "straight_knee_landing": 0.6,
+                    "soft_landing": 0.6,
                 },
-                # Level 3: 完整原始权重（所有乘数 = 1.0）
+                # Level 2 (Omni & Refinement): 全部恢复原始权重
                 {},
             ]
 
@@ -214,14 +212,25 @@ class LiteRewardCfg:
 @configclass
 class RobanLiteRewardCfg(LiteRewardCfg):
     """Reward 与 LiteRewardCfg 相同，但 body/joint 名称改为 Roban S14。"""
-    # 碰撞惩罚 - 使用Roban S14的body名称
+
+    # 与 amp_roban_share 一致：终止时给巨额惩罚（-200），让策略学到"摔倒 = 极大损失"
+    termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
+
+    # 碰撞惩罚（软惩罚，不终止）
+    # 与 amp_roban_share 一致：覆盖所有非脚部位 (leg_l/r 1~5, base, zarm_*)
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
         weight=-1.0,
         params={
             "sensor_cfg": SceneEntityCfg(
                 "contact_sensor",
-                body_names=["leg_l4_link", "leg_r4_link", "zarm_l2_link", "zarm_r2_link", "zarm_l4_link", "zarm_r4_link", "base_link"],
+                body_names=[
+                    "leg_l1_link", "leg_l2_link", "leg_l3_link", "leg_l4_link", "leg_l5_link",
+                    "leg_r1_link", "leg_r2_link", "leg_r3_link", "leg_r4_link", "leg_r5_link",
+                    "base_link",
+                    "zarm_l1_link", "zarm_l2_link", "zarm_l3_link", "zarm_l4_link",
+                    "zarm_r1_link", "zarm_r2_link", "zarm_r3_link", "zarm_r4_link",
+                ],
             ),
             "threshold": 1.0,
         },
@@ -401,6 +410,18 @@ class RobanLiteRewardCfg(LiteRewardCfg):
         },
     )
 
+    # ========== 静止惩罚（Stand Still Penalty）==========
+    # 当指令落在统一死区内时，惩罚关节运动，迫使机器人像雕塑一样完全静止。
+    # 与步态奖励的死区门控配合：有指令→步态奖励生效；无指令→静止惩罚生效。
+    stand_still_penalty = RewTerm(
+        func=mdp.stand_still_penalty,
+        weight=-2.0,
+        params={
+            "joint_vel_threshold": 0.1,
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
+    )
+
     # # 关节位置对称性：惩罚左右关节位置不对称（代替 FFT 对称性分析的简化版本）
     # joint_pos_symmetry = RewTerm(
     #     func=mdp.joint_pos_symmetry_l2,
@@ -442,8 +463,11 @@ class RobanWalkFlatEnvCfg:
         actor_obs_history_length=10,
         critic_obs_history_length=10,
         action_scale=0.5, # 也许可以尝试使用公式计算并替代
-        terminate_contacts_body_names=["leg_l4_link", "leg_r4_link", "zarm_l4_link", "zarm_r4_link", "base_link"],
+        # 与 amp_roban_share 一致：仅躯干碰地硬终止，膝盖/手臂碰撞用 undesired_contacts 软惩罚
+        terminate_contacts_body_names=["base_link"],
         feet_body_names=["leg_l6_link", "leg_r6_link"],
+        # 与 amp_roban_share 一致：根部高度低于 0.35m 时终止（真正摔倒）
+        terminate_min_height=0.35,
     )
     reward = RobanLiteRewardCfg()
     gait = GaitCfg()

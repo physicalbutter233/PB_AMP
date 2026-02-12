@@ -106,6 +106,44 @@ def is_terminated(env: BaseEnv | TienKungEnv) -> torch.Tensor:
     return env.reset_buf * ~env.time_out_buf
 
 
+def stand_still_penalty(
+    env: BaseEnv,
+    joint_vel_threshold: float = 0.1,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize joint movement when velocity commands are inside the deadband.
+
+    当指令落在统一死区内（is_command_active == False）时，机器人应像雕塑一样
+    完全静止。如果关节仍在运动（norm(joint_vel) > threshold），施加惩罚。
+
+    与步态奖励的死区门控配合使用：
+    - 有指令时：步态奖励生效，静止惩罚不生效
+    - 无指令时：步态奖励归零，静止惩罚生效
+
+    Args:
+        env: 环境实例（需要有 is_command_active 属性）
+        joint_vel_threshold: 关节速度范数容忍上限 (rad/s)
+        asset_cfg: 机器人配置
+
+    Returns:
+        正值惩罚（使用负权重），仅在无指令且关节仍在运动时非零
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_vel_norm = torch.norm(asset.data.joint_vel, dim=1)
+
+    # 使用统一死区 mask
+    if hasattr(env, "is_command_active"):
+        is_active = env.is_command_active
+    else:
+        # 回退逻辑（兼容旧环境）
+        cmd = env.command_generator.command
+        is_active = (torch.norm(cmd[:, :2], dim=1) > 0.2) | (torch.abs(cmd[:, 2]) > 0.2)
+
+    should_stand = ~is_active
+    penalty = torch.clamp(joint_vel_norm - joint_vel_threshold, min=0.0)
+    return penalty * should_stand.float()
+
+
 def feet_air_time_positive_biped(
     env: BaseEnv | TienKungEnv, threshold: float, sensor_cfg: SceneEntityCfg
 ) -> torch.Tensor:
