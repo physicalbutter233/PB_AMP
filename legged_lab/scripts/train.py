@@ -31,6 +31,11 @@ parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
+parser.add_argument(
+    "--no-velocity-curriculum",
+    action="store_true",
+    help="Disable velocity curriculum (full command range from start). For ablation.",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -69,6 +74,11 @@ def train():
 
     if args_cli.num_envs is not None:
         env_cfg.scene.num_envs = args_cli.num_envs
+
+    if getattr(args_cli, "no_velocity_curriculum", False):
+        if hasattr(env_cfg, "velocity_curriculum") and env_cfg.velocity_curriculum is not None:
+            env_cfg.velocity_curriculum.enable = False
+            print("[INFO] Velocity curriculum disabled (--no-velocity-curriculum).")
 
     agent_cfg = update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.seed = agent_cfg.seed

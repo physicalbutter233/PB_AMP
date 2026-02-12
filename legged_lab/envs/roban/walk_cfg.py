@@ -71,6 +71,9 @@ class VelocityCurriculumCfg:
 
     冷却机制：级别变更后，缓冲区中残留着旧级别指令下的数据。
     通过 cooldown_steps 忽略掉在旧级别下开始的 episode，避免"火箭跳级"。
+
+    消融实验：设置 enable=False 关闭课程（或训练时加 --no-velocity-curriculum），
+    则始终使用 commands.ranges 的完整速度范围。
     """
     enable: bool = True
 
@@ -392,7 +395,7 @@ class RobanWalkFlatEnvCfg:
     robot: RobotCfg = RobotCfg(
         actor_obs_history_length=10,
         critic_obs_history_length=10,
-        action_scale=0.25, # 也许可以尝试使用公式计算并替代
+        action_scale=0.5, # 也许可以尝试使用公式计算并替代
         terminate_contacts_body_names=["leg_l4_link", "leg_r4_link", "zarm_l4_link", "zarm_r4_link", "base_link"],
         feet_body_names=["leg_l6_link", "leg_r6_link"],
     )
