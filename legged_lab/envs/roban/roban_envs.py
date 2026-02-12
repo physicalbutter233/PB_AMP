@@ -630,21 +630,60 @@ class RobanEnv(VecEnv):
         # 只有在该时间戳之后才开始的 episode 才会被记录
         self._vel_cur_level_change_step = 0  # 初始时为 0，所有 episode 都有效
 
-        # 应用初始级别（Level 0）
+        # ── 动态奖励缩放：备份原始权重 ──
+        # 从 RewardManager 中读取每个 reward term 的原始权重并保存，
+        # 后续 _apply_reward_scales 通过 base_weight × multiplier 计算，避免复合乘法漂移。
+        self._reward_base_weights: dict[str, float] = {}
+        for name in self.reward_manager._term_names:
+            cfg = self.reward_manager.get_term_cfg(name)
+            self._reward_base_weights[name] = cfg.weight
+
+        # 应用初始级别（Level 0）— 同时更新速度范围和奖励权重
         self._apply_velocity_level(0)
         print(f"[VelocityCurriculum] 已启用，共 {len(cur_cfg.levels)} 级")
         print(f"  Level 0: {cur_cfg.levels[0]}")
         print(f"  promote: ep>{cur_cfg.promote_threshold*100:.0f}%max "
               f"AND lin_err<{cur_cfg.promote_lin_vel_err_limit}m/s "
               f"AND ang_err<{cur_cfg.promote_ang_vel_err_limit}rad/s")
+        if getattr(cur_cfg, "reward_multipliers", None):
+            print(f"  [DynamicRewardScaling] Level 0 multipliers: {cur_cfg.reward_multipliers[0]}")
 
     def _apply_velocity_level(self, level: int):
-        """将指定级别的速度范围写入 command_generator。"""
+        """将指定级别的速度范围写入 command_generator，并更新奖励权重缩放。"""
         ranges = self._vel_cur_cfg.levels[level]
         cmd_ranges = self.command_generator.cfg.ranges
         cmd_ranges.lin_vel_x = tuple(ranges["lin_vel_x"])
         cmd_ranges.lin_vel_y = tuple(ranges["lin_vel_y"])
         cmd_ranges.ang_vel_z = tuple(ranges["ang_vel_z"])
+
+        # 动态奖励缩放
+        self._apply_reward_scales(level)
+
+    def _apply_reward_scales(self, level: int):
+        """根据课程级别，用 base_weight × multiplier 更新 RewardManager 中各 term 的权重。
+
+        - reward_multipliers[level] 中列出的 term：使用指定乘数
+        - 未列出的 term：乘数默认为 1.0（保持原始权重）
+        - 始终从 _reward_base_weights（原始权重备份）出发计算，避免复合乘法漂移
+        """
+        multipliers_list = getattr(self._vel_cur_cfg, "reward_multipliers", None)
+        if not multipliers_list:
+            return  # 未配置动态缩放，跳过
+
+        # 获取当前级别的乘数表（超出范围则用空 dict → 全部 1.0）
+        if level < len(multipliers_list):
+            level_multipliers = multipliers_list[level]
+        else:
+            level_multipliers = {}
+
+        for name in self.reward_manager._term_names:
+            base_w = self._reward_base_weights[name]
+            multiplier = level_multipliers.get(name, 1.0)
+            new_weight = base_w * multiplier
+
+            # 直接修改 term_cfg.weight（RewardManager.compute 每步读取此值）
+            term_cfg = self.reward_manager.get_term_cfg(name)
+            term_cfg.weight = new_weight
 
     def _accumulate_tracking_error(self):
         """每个 env step 调用，累积线速度和角速度跟踪误差。
@@ -710,9 +749,9 @@ class RobanEnv(VecEnv):
         # ── 检查是否有足够样本做决策 ──
         min_samples = self._vel_cur_cfg.buffer_size // 4
         if len(self._vel_cur_ep_lengths) < min_samples:
-            return {
-                "Curriculum/velocity_level": float(self._vel_cur_level),
-            }
+            extras = {"Curriculum/velocity_level": float(self._vel_cur_level)}
+            extras.update(self._get_reward_scaling_extras())
+            return extras
 
         # ── 计算统计量 ──
         mean_ep_length = sum(self._vel_cur_ep_lengths) / len(self._vel_cur_ep_lengths)
@@ -760,12 +799,31 @@ class RobanEnv(VecEnv):
                 f"(ep={mean_ep_length:.1f}s<{demote_thresh:.1f}s)"
             )
 
-        return {
+        extras = {
             "Curriculum/velocity_level": float(self._vel_cur_level),
             "Curriculum/mean_episode_length": mean_ep_length,
             "Curriculum/mean_lin_vel_error": mean_lin_err,
             "Curriculum/mean_ang_vel_error": mean_ang_err,
         }
+        extras.update(self._get_reward_scaling_extras())
+        return extras
+
+    def _get_reward_scaling_extras(self) -> dict:
+        """返回当前动态奖励缩放状态的 TensorBoard 日志条目。"""
+        extras = {}
+        if not hasattr(self, "_reward_base_weights"):
+            return extras
+        # 记录关键跟踪奖励的当前有效权重，方便在 TensorBoard 中验证动态缩放是否生效
+        for name in ("track_lin_vel_xy_exp", "track_ang_vel_z_exp"):
+            if name in self._reward_base_weights:
+                current_cfg = self.reward_manager.get_term_cfg(name)
+                extras[f"Curriculum/reward_weight/{name}"] = current_cfg.weight
+        # 记录几个关键步态奖励的当前有效权重
+        for name in ("feet_air_time", "step_frequency", "feet_distance", "straight_knee_landing"):
+            if name in self._reward_base_weights:
+                current_cfg = self.reward_manager.get_term_cfg(name)
+                extras[f"Curriculum/reward_weight/{name}"] = current_cfg.weight
+        return extras
 
     def update_terrain_levels(self, env_ids):
         distance = torch.norm(self.robot.data.root_pos_w[env_ids, :2] - self.scene.env_origins[env_ids, :2], dim=1)

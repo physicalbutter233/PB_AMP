@@ -95,6 +95,13 @@ class VelocityCurriculumCfg:
     # ── 各级别的速度范围 ──
     levels: list = None
 
+    # ── 各级别的奖励权重乘数（Level-Based Dynamic Reward Scaling）──
+    # 每个元素是一个 dict，key 为奖励名称，value 为该级别对应的乘数。
+    # 未出现在 dict 中的奖励名称默认乘数为 1.0。
+    # 目的：低级别时大幅提升速度跟踪权重、抑制步态约束，迫使机器人先学会动；
+    #       高级别时恢复原始权重，精调步态质量。
+    reward_multipliers: list = None
+
     def __post_init__(self):
         if self.levels is None:
             self.levels = [
@@ -106,6 +113,45 @@ class VelocityCurriculumCfg:
                 {"lin_vel_x": (-0.4, 0.8), "lin_vel_y": (-0.3, 0.3), "ang_vel_z": (-1.2, 1.2)},
                 # Level 3: 完整范围
                 {"lin_vel_x": (-0.6, 1.0), "lin_vel_y": (-0.5, 0.5), "ang_vel_z": (-1.57, 1.57)},
+            ]
+
+        if self.reward_multipliers is None:
+            self.reward_multipliers = [
+                # Level 0: 大幅提升跟踪权重 (×4)，压制步态约束 (×0.3)，迫使机器人先动起来
+                {
+                    "track_lin_vel_xy_exp": 4.0,
+                    "track_ang_vel_z_exp": 4.0,
+                    "feet_air_time": 0.3,
+                    "step_frequency": 0.3,
+                    "feet_distance": 0.3,
+                    "straight_knee_landing": 0.3,
+                    "feet_height": 0.3,
+                    "soft_landing": 0.3,
+                },
+                # Level 1: 跟踪权重逐步回落，步态约束逐步恢复
+                {
+                    "track_lin_vel_xy_exp": 3.0,
+                    "track_ang_vel_z_exp": 3.0,
+                    "feet_air_time": 0.5,
+                    "step_frequency": 0.5,
+                    "feet_distance": 0.5,
+                    "straight_knee_landing": 0.5,
+                    "feet_height": 0.5,
+                    "soft_landing": 0.5,
+                },
+                # Level 2: 接近原始配置
+                {
+                    "track_lin_vel_xy_exp": 2.0,
+                    "track_ang_vel_z_exp": 2.0,
+                    "feet_air_time": 0.75,
+                    "step_frequency": 0.75,
+                    "feet_distance": 0.75,
+                    "straight_knee_landing": 0.75,
+                    "feet_height": 0.75,
+                    "soft_landing": 0.75,
+                },
+                # Level 3: 完整原始权重（所有乘数 = 1.0）
+                {},
             ]
 
 
