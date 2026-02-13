@@ -287,7 +287,7 @@ class RobanLiteRewardCfg(LiteRewardCfg):
     )
     humanoid_swing_foot_height = RewTerm(
         func=mdp.humanoid_swing_foot_height_reward,
-        weight=1.0,  # moderate, does not dominate velocity tracking
+        weight=3.5,  # moderate, does not dominate velocity tracking
         params={
             "threshold": 10.0,
             "height_threshold": 0.05,
