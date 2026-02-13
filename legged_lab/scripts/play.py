@@ -77,10 +77,12 @@ def play():
     env_cfg.scene.num_envs = 50
     env_cfg.scene.env_spacing = 2.5
     env_cfg.commands.rel_standing_envs = 0.0
-    env_cfg.commands.ranges.lin_vel_x = (0.5, 0.5)
+    env_cfg.commands.ranges.lin_vel_x = (1.0, 1.0)
     env_cfg.commands.ranges.lin_vel_y = (0.0, 0.0)
-
-    env_cfg.commands.ranges.ang_vel_z = (0.0, 0.0)# 禁止旋转，只向前走
+    env_cfg.commands.ranges.ang_vel_z = (0.0, 0.0)  # 禁止旋转，只向前走
+    # 禁用速度课程：否则 _apply_velocity_level(0) 会覆盖上面的 ranges
+    if hasattr(env_cfg, "velocity_curriculum") and env_cfg.velocity_curriculum is not None:
+        env_cfg.velocity_curriculum.enable = False
     env_cfg.scene.height_scanner.drift_range = (0.0, 0.0)
     env_cfg.scene.terrain_generator = None
     env_cfg.scene.terrain_type = "plane"

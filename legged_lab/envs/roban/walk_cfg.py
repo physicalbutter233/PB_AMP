@@ -132,7 +132,8 @@ class VelocityCurriculumCfg:
                     "track_lin_vel_xy_exp": 1.5,
                     "flat_orientation_exp": 1.0,
                     "base_height_penalty": 1.0,
-                    "feet_air_time": 1.0,
+                    "humanoid_single_support_reward": 1.0,
+                    "humanoid_swing_foot_height": 1.0,
                     "feet_contact_time_symmetry": 1.0,
                     "feet_distance": 1.0,
                 },
@@ -142,7 +143,8 @@ class VelocityCurriculumCfg:
                     "track_ang_vel_z_exp": 1.5,
                     "flat_orientation_exp": 1.0,
                     "base_height_penalty": 1.0,
-                    "feet_air_time": 1.0,
+                    "humanoid_single_support_reward": 1.0,
+                    "humanoid_swing_foot_height": 1.0,
                     "feet_contact_time_symmetry": 1.0,
                 },
                 # Level 2 (Omni & Refinement): 原始权重
@@ -266,20 +268,47 @@ class RobanLiteRewardCfg(LiteRewardCfg):
         },
     )
 
-    # ─── 2. Gait Stylers (POSITIVE, 高斯核，目标滞空随速度线性变化) ───
-    # 速度 0.3→目标滞空 0.5s，0.6→0.3s；指令<0.25 不抬腿；超过 0.5/0.3 时奖励封顶为目标分
-    feet_air_time = RewTerm(
-        func=mdp.feet_air_time_exp_speed_adaptive,
-        weight=1.0,
+    # ─── 2. Gait Stylers: Contact Phase (no air-time shaping) ───
+    # Induce natural leg lifting through stable single support.
+    humanoid_flight_penalty = RewTerm(
+        func=mdp.humanoid_flight_penalty,
+        weight=-5.0,  # strong: flight forbidden
+        params={"threshold": 10.0, "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"])},
+    )
+    humanoid_double_support_penalty = RewTerm(
+        func=mdp.humanoid_double_support_penalty,
+        weight=-0.1,  # small: discourage persistent double support
+        params={"threshold": 10.0, "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"])},
+    )
+    humanoid_single_support_reward = RewTerm(
+        func=mdp.humanoid_single_support_reward,
+        weight=0.5,  # moderate: single support > double penalty
+        params={"threshold": 10.0, "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"])},
+    )
+    humanoid_swing_foot_height = RewTerm(
+        func=mdp.humanoid_swing_foot_height_reward,
+        weight=0.7,  # moderate, does not dominate velocity tracking
         params={
-            "target_air_at_speed_low": 0.5,
-            "target_air_at_speed_high": 0.3,
-            "speed_low": 0.3,
-            "speed_high": 0.6,
-            "min_cmd_speed": 0.25,
-            "std": 0.08,
+            "threshold": 10.0,
+            "height_threshold": 0.05,
+            "max_height": 0.12,
             "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
+            "asset_cfg": SceneEntityCfg("robot", body_names=["leg_l6_link", "leg_r6_link"]),
         },
+    )
+    humanoid_swing_foot_forward = RewTerm(
+        func=mdp.humanoid_swing_foot_forward_reward,
+        weight=1.5,  # small: anti-moonwalk
+        params={
+            "threshold": 10.0,
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
+            "asset_cfg": SceneEntityCfg("robot", body_names=["leg_l6_link", "leg_r6_link"]),
+        },
+    )
+    humanoid_single_support_duration_penalty = RewTerm(
+        func=mdp.humanoid_single_support_duration_penalty,
+        weight=-0.5,  # small: encourage timely step transition
+        params={"max_duration": 0.4, "threshold": 10.0, "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"])},
     )
 
     feet_contact_time_symmetry = RewTerm(
@@ -292,6 +321,7 @@ class RobanLiteRewardCfg(LiteRewardCfg):
     )
 
     # ─── REMOVED/DISABLED ───
+    # feet_air_time (replaced by contact-phase rewards: single support + swing height)
     # stand_still_penalty, dof_vel_limits, lin_vel_z_l2, ang_vel_xy_l2, stumble, feet_force
     # step_frequency, feet_height, straight_knee_landing, soft_landing, root_height_maintain
 

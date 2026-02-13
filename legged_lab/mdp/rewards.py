@@ -879,6 +879,174 @@ def step_frequency_penalty(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Humanoid Locomotion: Contact Phase Rewards (no air-time shaping)
+# Induce natural leg lifting through stable single support.
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def humanoid_flight_penalty(
+    env: BaseEnv | TienKungEnv, threshold: float = 10.0, sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor")
+) -> torch.Tensor:
+    """Strong penalty when both feet are off the ground (flight phase forbidden).
+
+    Returns 1.0 when number_of_contacts == 0, else 0. Use with large negative weight.
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    net_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    in_contact = torch.norm(net_forces, dim=-1) > threshold  # [batch, 2]
+    num_contacts = torch.sum(in_contact.int(), dim=1)
+    return (num_contacts == 0).float()
+
+
+def humanoid_double_support_penalty(
+    env: BaseEnv | TienKungEnv, threshold: float = 10.0, sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor")
+) -> torch.Tensor:
+    """Small penalty when both feet are on the ground (discourage persistent double support).
+
+    Returns 1.0 when number_of_contacts == 2, else 0. Use with small negative weight.
+    Only active when command is non-zero.
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    net_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    in_contact = torch.norm(net_forces, dim=-1) > threshold  # [batch, 2]
+    num_contacts = torch.sum(in_contact.int(), dim=1)
+    has_command = (
+        torch.norm(env.command_generator.command[:, :2], dim=1)
+        + torch.abs(env.command_generator.command[:, 2])
+    ) > 0.1
+    return ((num_contacts == 2) & has_command).float()
+
+
+def humanoid_single_support_reward(
+    env: BaseEnv | TienKungEnv, threshold: float = 10.0, sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor")
+) -> torch.Tensor:
+    """Moderate positive reward when exactly one foot is in contact (stable single support).
+
+    Returns 1.0 when number_of_contacts == 1, else 0. Use with moderate positive weight.
+    Must be larger than double support penalty. Only active when command is non-zero.
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    net_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    in_contact = torch.norm(net_forces, dim=-1) > threshold  # [batch, 2]
+    num_contacts = torch.sum(in_contact.int(), dim=1)
+    has_command = (
+        torch.norm(env.command_generator.command[:, :2], dim=1)
+        + torch.abs(env.command_generator.command[:, 2])
+    ) > 0.1
+    return ((num_contacts == 1) & has_command).float()
+
+
+def humanoid_swing_foot_height_reward(
+    env: BaseEnv | TienKungEnv,
+    threshold: float = 10.0,
+    height_threshold: float = 0.05,
+    max_height: float = 0.12,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Continuous swing foot height reward during single support only.
+
+    - Only rewards the non-contact (swing) foot.
+    - Positive reward for height above height_threshold (e.g. 5 cm).
+    - Clipped above max_height (e.g. 10–15 cm) to prevent moonwalk/high kick.
+    - Does NOT reward stance foot. Use moderate weight so it does not dominate velocity tracking.
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    asset: Articulation = env.scene[asset_cfg.name]
+    net_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    in_contact = torch.norm(net_forces, dim=-1) > threshold  # [batch, 2]
+    num_contacts = torch.sum(in_contact.int(), dim=1)
+    single_support = num_contacts == 1
+    has_command = (
+        torch.norm(env.command_generator.command[:, :2], dim=1)
+        + torch.abs(env.command_generator.command[:, 2])
+    ) > 0.1
+
+    feet_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]  # [batch, 2] z in world
+    feet_height = torch.nan_to_num(feet_height, nan=0.0, posinf=0.15, neginf=0.0)
+    excess_height = (feet_height - height_threshold).clamp(min=0.0)
+    clipped_height = excess_height.clamp(max=max_height - height_threshold)
+
+    # Swing foot = the one NOT in contact; reward only swing foot height
+    swing_height = torch.where(in_contact, torch.zeros_like(clipped_height), clipped_height)
+    reward = torch.sum(swing_height, dim=1)
+    return reward * single_support.float() * has_command.float()
+
+
+def humanoid_swing_foot_forward_reward(
+    env: BaseEnv | TienKungEnv,
+    threshold: float = 10.0,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward forward displacement of swing foot during single support (anti-moonwalk).
+
+    Swing foot forward offset = (swing_foot_pos - root_pos) dot forward_dir in yaw frame.
+    Positive when swing foot is ahead of root. Use small positive weight.
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    asset: Articulation = env.scene[asset_cfg.name]
+    net_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    in_contact = torch.norm(net_forces, dim=-1) > threshold  # [batch, 2]
+    num_contacts = torch.sum(in_contact.int(), dim=1)
+    single_support = num_contacts == 1
+    has_command = (
+        torch.norm(env.command_generator.command[:, :2], dim=1)
+        + torch.abs(env.command_generator.command[:, 2])
+    ) > 0.1
+
+    root_pos = asset.data.root_pos_w[:, :3]
+    root_quat = asset.data.root_quat_w
+    yaw_quat = math_utils.yaw_quat(root_quat)
+    dev = root_pos.device
+    forward_body = torch.tensor([1.0, 0.0, 0.0], device=dev, dtype=root_pos.dtype).unsqueeze(0).expand(env.num_envs, 3)
+    forward_w = math_utils.quat_rotate(yaw_quat, forward_body)  # [batch, 3]
+    feet_pos = asset.data.body_pos_w[:, asset_cfg.body_ids, :]  # [batch, 2, 3]
+    rel_pos = feet_pos - root_pos.unsqueeze(1)  # [batch, 2, 3]
+    forward_disp = torch.sum(rel_pos * forward_w.unsqueeze(1), dim=-1)  # [batch, 2]
+    forward_disp = forward_disp.clamp(min=0.0)  # only reward positive (ahead)
+
+    swing_forward = torch.where(in_contact, torch.zeros_like(forward_disp), forward_disp)
+    reward = torch.sum(swing_forward, dim=1)
+    return reward * single_support.float() * has_command.float()
+
+
+def humanoid_single_support_duration_penalty(
+    env: BaseEnv | TienKungEnv,
+    max_duration: float = 0.4,
+    threshold: float = 10.0,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
+) -> torch.Tensor:
+    """Small penalty if single support lasts too long (encourage timely step transition).
+
+    Tracks duration of current single-support phase; penalizes excess over max_duration.
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    net_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    in_contact = torch.norm(net_forces, dim=-1) > threshold
+    num_contacts = torch.sum(in_contact.int(), dim=1)
+    single_support = num_contacts == 1
+    has_command = (
+        torch.norm(env.command_generator.command[:, :2], dim=1)
+        + torch.abs(env.command_generator.command[:, 2])
+    ) > 0.1
+
+    if not hasattr(env, "_humanoid_single_support_time"):
+        env._humanoid_single_support_time = torch.zeros(env.num_envs, device=net_forces.device)
+    fresh = env.episode_length_buf <= 1
+    if fresh.any():
+        env._humanoid_single_support_time[fresh] = 0
+
+    env._humanoid_single_support_time = torch.where(
+        single_support & has_command,
+        env._humanoid_single_support_time + env.step_dt,
+        torch.zeros_like(env._humanoid_single_support_time),
+    )
+    excess = (env._humanoid_single_support_time - max_duration).clamp(min=0.0)
+    return excess * single_support.float() * has_command.float()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Symmetry Reward Functions (for biped gait symmetry enforcement)
 # ══════════════════════════════════════════════════════════════════════════════
 

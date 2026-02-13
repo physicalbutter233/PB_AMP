@@ -877,7 +877,8 @@ class RobanEnv(VecEnv):
         tracked_names = (
             "track_lin_vel_xy_exp", "track_ang_vel_z_exp",
             "flat_orientation_exp", "base_height_penalty",
-            "feet_air_time", "feet_contact_time_symmetry", "feet_distance",
+            "humanoid_single_support_reward", "humanoid_swing_foot_height",
+            "feet_contact_time_symmetry", "feet_distance",
         )
         for name in tracked_names:
             if name in self._reward_base_weights:
