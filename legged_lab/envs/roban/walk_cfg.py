@@ -94,8 +94,9 @@ class VelocityCurriculumCfg:
 
     # ── 统一死区（Unified Deadband）──
     # 指令在死区内 → is_command_active = False → 步态奖励归零 + 静止惩罚生效
-    lin_vel_deadband: float = 0.2   # m/s, ||cmd_xy|| > 此值才算有指令
-    ang_vel_deadband: float = 0.2   # rad/s, |cmd_yaw| > 此值才算有指令
+    lin_vel_deadband: float = 0.25   # m/s, |cmd_x| > 此值才算有前进/后退指令
+    lat_vel_deadband: float = 0.25  # m/s, |cmd_y| > 此值才算有侧移指令
+    ang_vel_deadband: float = 0.25   # rad/s, |cmd_yaw| > 此值才算有转向指令
 
     # ── 各级别的速度范围（倒金字塔）──
     levels: list = None
@@ -108,12 +109,12 @@ class VelocityCurriculumCfg:
             self.levels = [
                 # Level 0 (Ignition): 强制进入"黄金速度区间"，动量辅助平衡
                 # lin_vel_y 锁为 0，ang_vel_z 仅允许微小噪声
-                {"lin_vel_x": (0.35, 0.6), "lin_vel_y": (0.0, 0.0), "ang_vel_z": (-0.1, 0.1)},
+                {"lin_vel_x": (0.4, 0.5), "lin_vel_y": (0.0, 0.0), "ang_vel_z": (-0.5, 0.5)},
                 # Level 1 (Steering): 拓宽前进范围，解锁转向
                 # lin_vel_y 仍锁定，保持步态纯度
-                {"lin_vel_x": (0.25, 1.0), "lin_vel_y": (0.0, 0.0), "ang_vel_z": (-1.0, 1.0)},
+                {"lin_vel_x": (0.3, 0.6), "lin_vel_y": (0.0, 0.0), "ang_vel_z": (-0.8, 0.8)},
                 # Level 2 (Omni & Refinement): 全方向运动——最终形态
-                {"lin_vel_x": (-0.5, 1.2), "lin_vel_y": (-0.3, 0.3), "ang_vel_z": (-1.5, 1.5)},
+                {"lin_vel_x": (-0.6, 0.6), "lin_vel_y": (-0.6, 0.6), "ang_vel_z": (-1.0, 1.0)},
             ]
 
         if self.promote_criteria is None:
@@ -126,59 +127,78 @@ class VelocityCurriculumCfg:
 
         if self.reward_multipliers is None:
             self.reward_multipliers = [
-                # Level 0 (Ignition): 聚焦前进，允许粗糙步态，保持身体水平
+                # Level 0 (Ignition): 聚焦前进与身体水平
                 {
-                    "track_lin_vel_xy_exp": 3.0,     # 聚焦：往前走
-                    "flat_orientation_l2": 2.0,       # 保持身体水平（动量稳定必需）
-                    "feet_air_time": 0.5,             # 允许粗糙步态，别摔就行
-                    "step_frequency": 0.5,
-                    "feet_height": 0.5,
-                    "straight_knee_landing": 0.3,     # 不急着要求落地姿态
-                    "soft_landing": 0.3,
-                    "feet_distance": 0.5,
-                    "feet_contact_time_symmetry": 0.5,
+                    "track_lin_vel_xy_exp": 1.5,
+                    "flat_orientation_exp": 1.0,
+                    "base_height_penalty": 1.0,
+                    "feet_air_time": 1.0,
+                    "feet_contact_time_symmetry": 1.0,
+                    "feet_distance": 1.0,
                 },
-                # Level 1 (Steering): 聚焦转向精度，开始收紧步态
+                # Level 1 (Steering): 聚焦转向精度
                 {
-                    "track_lin_vel_xy_exp": 2.0,
-                    "track_ang_vel_z_exp": 2.0,       # 聚焦：转向精度
-                    "feet_air_time": 0.8,             # 开始要求步态质量
-                    "step_frequency": 0.8,
-                    "feet_height": 0.8,
-                    "straight_knee_landing": 0.6,
-                    "soft_landing": 0.6,
+                    "track_lin_vel_xy_exp": 1.0,
+                    "track_ang_vel_z_exp": 1.5,
+                    "flat_orientation_exp": 1.0,
+                    "base_height_penalty": 1.0,
+                    "feet_air_time": 1.0,
+                    "feet_contact_time_symmetry": 1.0,
                 },
-                # Level 2 (Omni & Refinement): 全部恢复原始权重
+                # Level 2 (Omni & Refinement): 原始权重
                 {},
             ]
 
 
 @configclass
 class LiteRewardCfg:
-    """简化的奖励配置，与kuavo对应"""
-    # 速度跟踪 (对应kuavo: tracking_lin_vel=1.2, tracking_ang_vel=1.1)
-    # 大幅增加权重以使 AMP 占比降至 4%（Task 占比 96%）
-    track_lin_vel_xy_exp = RewTerm(func=mdp.track_lin_vel_xy_yaw_frame_exp, weight=2.5, params={"std": 0.5})  # 2.5 → 10.0
-    track_ang_vel_z_exp = RewTerm(func=mdp.track_ang_vel_z_world_exp, weight=2.0, params={"std": 0.5})         # 2.0 → 8.0
-    
-    # 速度不匹配惩罚 (对应kuavo: vel_mismatch_exp=0.5)
-    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
-    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.5)
-    
-    # 姿态控制 (对应kuavo: orientation=1.0)
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-1.0)
-    
-    # 能量消耗 (对应kuavo: torques=-1e-5, dof_vel=-5e-4)
-    energy = RewTerm(func=mdp.energy, weight=-1e-5)
-    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-1e-7)
-    
-    # 动作平滑度 (对应kuavo: action_smoothness=-0.002)
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.002)
-    
-    # 碰撞惩罚 (对应kuavo: collision=-1.0)
+    """Pragmatic Minimalist Core: Positive Gaussian Objectives + Negative Constraints."""
+
+    # ─── 1. Objectives (POSITIVE Gaussian) ───
+    track_lin_vel_xy_exp = RewTerm(
+        func=mdp.track_lin_vel_xy_yaw_frame_exp, weight=2.0, params={"std": 0.5}
+    )
+    track_ang_vel_z_exp = RewTerm(
+        func=mdp.track_ang_vel_z_world_exp, weight=1.5, params={"std": 0.5}
+    )
+    base_height_penalty = RewTerm(
+        func=mdp.base_height_penalty,
+        weight=-1.0,
+        params={"min_height": 0.6},
+    )
+    flat_orientation_exp = RewTerm(
+        func=mdp.flat_orientation_exp, weight=1.0, params={"std": 0.25}
+    )
+
+    # ─── 2. Gait Stylers (POSITIVE) ───
+    # (feet_air_time, feet_contact_time_symmetry defined in RobanLiteRewardCfg with robot body names)
+
+    # ─── 3. Physics Constraints (NEGATIVE) ───
+    feet_slide = RewTerm(
+        func=mdp.feet_slide,
+        weight=-0.5,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="ankle_roll.*"),
+            "asset_cfg": SceneEntityCfg("robot", body_names="ankle_roll.*"),
+        },
+    )
+    feet_orientation = RewTerm(
+        func=mdp.feet_orientation_l2,
+        weight=-0.5,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names="ankle_roll.*")},
+    )
+    feet_distance = RewTerm(
+        func=mdp.feet_distance_penalty,
+        weight=-0.2,
+        params={
+            "min_dist": 0.20,
+            "max_dist": 0.32,
+            "asset_cfg": SceneEntityCfg("robot", body_names="ankle_roll.*"),
+        },
+    )
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
-        weight=-3.0,
+        weight=-1.0,
         params={
             "sensor_cfg": SceneEntityCfg(
                 "contact_sensor", body_names=["knee_pitch.*", "shoulder_roll.*", "elbow_pitch.*", "pelvis"]
@@ -186,38 +206,23 @@ class LiteRewardCfg:
             "threshold": 1.0,
         },
     )
-    
-    # 脚部滑动 (对应kuavo: foot_slip=-0.05)
-    feet_slide = RewTerm(
-        func=mdp.feet_slide,
-        weight=-0.05,
-        params={
-            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="ankle_roll.*"),
-            "asset_cfg": SceneEntityCfg("robot", body_names="ankle_roll.*"),
-        },
-    )
-    
-    # 脚部接触力 (对应kuavo: feet_contact_forces=-0.01)
-    feet_force = RewTerm(
-        func=mdp.body_force,
-        weight=-0.01,
-        params={
-            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="ankle_roll.*"),
-            "threshold": 500,
-            "max_reward": 400,
-        },
-    )
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+    torques = RewTerm(func=mdp.energy, weight=-0.0001)
+
+    # ─── 4. Safety Rails (NEGATIVE) ───
+    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-2.5e-7)
+    dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-10.0)
+
+    # ─── REMOVED/DISABLED (redundant or covered by above) ───
+    # stand_still_penalty, dof_vel_limits, lin_vel_z_l2, ang_vel_xy_l2, stumble, feet_force
 
 
 @configclass
 class RobanLiteRewardCfg(LiteRewardCfg):
-    """Reward 与 LiteRewardCfg 相同，但 body/joint 名称改为 Roban S14。"""
+    """Pragmatic Minimalist Core with Roban S14 body/joint names."""
 
-    # 与 amp_roban_share 一致：终止时给巨额惩罚（-200），让策略学到"摔倒 = 极大损失"
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
 
-    # 碰撞惩罚（软惩罚，不终止）
-    # 与 amp_roban_share 一致：覆盖所有非脚部位 (leg_l/r 1~5, base, zarm_*)
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
         weight=-1.0,
@@ -235,206 +240,60 @@ class RobanLiteRewardCfg(LiteRewardCfg):
             "threshold": 1.0,
         },
     )
-    
-    # 脚部滑动 - 使用Roban S14的body名称
+
     feet_slide = RewTerm(
         func=mdp.feet_slide,
-        weight=-0.05,
+        weight=-0.5,
         params={
             "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
             "asset_cfg": SceneEntityCfg("robot", body_names=["leg_l6_link", "leg_r6_link"]),
         },
     )
-    
-    # 脚部接触力 - 使用Roban S14的body名称
-    feet_force = RewTerm(
-        func=mdp.body_force,
-        weight=-0.01,
-        params={
-            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
-            "threshold": 500,
-            "max_reward": 400,
-        },
-    )
-    
-    # ========== 滞空时间奖励（带裁剪） ==========
-    # 使用 last_air_time + first_contact 触发，仅在着地瞬间给奖励
-    # threshold_min=0.1: 低于 0.1s 的摆动不算步（防原地颤抖）
-    # threshold_max=0.3: 超过 0.3s 不再有额外奖励（防大跨步）
-    feet_air_time = RewTerm(
-        func=mdp.feet_air_time_clip_biped,
-        weight=20.0,
-        params={
-            "threshold_min": 0.25,
-            "threshold_max": 0.4,
-            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
-        },
+
+    feet_orientation = RewTerm(
+        func=mdp.feet_orientation_l2,
+        weight=-0.5,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=["leg_l6_link", "leg_r6_link"])},
     )
 
-    # ========== 步频惩罚 ==========
-    # 惩罚双脚同时着地超过 0.2s，迫使机器人快速迈步
-    # 返回负惩罚值，用正 weight
-    step_frequency = RewTerm(
-        func=mdp.step_frequency_penalty,
-        weight=10.0,
-        params={
-            "max_grounded_time": 0.2,
-            "penalty_scale": 2.0,
-            "velocity_threshold": 0.12,
-            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
-        },
-    )
-
-    # ========== 抬脚高度奖励 ==========
-    # 每个摆动周期只在着地瞬间奖励一次，奖励该周期的最大抬脚高度
-    # max_height_clip=0.15: 超过 15cm 不再有额外奖励（防止甩腿过高→大跨步）
-    # amp_roban_share 参考值：weight=12.0, max_height_clip=0.15
-    feet_height = RewTerm(
-        func=mdp.feet_height_cycle,
-        weight=12.0,
-        params={
-            "max_height_clip": 0.15,
-            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
-            "asset_cfg": SceneEntityCfg("robot", body_names=["leg_l6_link", "leg_r6_link"]),
-        },
-    )
-
-    # ========== 自然落地奖励 ==========
-    # 着地瞬间膝盖伸直（人类走路落地腿近乎伸直）
-    straight_knee_landing = RewTerm(
-        func=mdp.contact_ground_straight_knee,
-        weight=15.0,
-        params={
-            "std": 0.3,
-            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
-            "asset_cfg": SceneEntityCfg("robot", joint_names=["leg_l4_joint", "leg_r4_joint"]),
-        },
-    )
-
-    # 着地瞬间脚部垂直速度小（轻柔落地，不砸地）
-    soft_landing = RewTerm(
-        func=mdp.contact_momentum,
-        weight=1.0,
-        params={
-            "std": 0.05,
-            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
-            "asset_cfg": SceneEntityCfg("robot", body_names=["leg_l6_link", "leg_r6_link"]),
-        },
-    )
-
-    ## 以下是为了防止诡异行走而设置
-
-    
-    # ========== 髋关节 Roll (L2/R2) 防劈叉惩罚 ==========
-    # 由于 L1/R1 的旋转轴 (0, ±0.707, -0.707) 没有 X 分量,
-    # L2/R2 (roll, 轴=X) 在正常前后行走时不需要补偿 L1 的运动.
-    # 因此可以较严格地约束 L2/R2, 防止双腿诡异岔开.
-    #
-    # # 速度条件版本: 前向行走时 deadzone=0.1rad(约5.7°),
-    # # 侧向行走时自动放宽到 0.3rad(约17.2°)
-    # hip_roll_penalty = RewTerm(
-    #     func=mdp.hip_roll_conditional_penalty,
-    #     weight=-5.0,
-    #     params={
-    #         "deadzone_base": 0.2,    # 前向行走时的死区 (rad)
-    #         "deadzone_max": 0.4,     # 侧向行走时的死区 (rad)
-    #         "vel_threshold": 0.3,    # 侧向速度阈值 (m/s)
-    #         "asset_cfg": SceneEntityCfg(
-    #             "robot",
-    #             joint_names=["leg_l2_joint", "leg_r2_joint"],
-    #         ),
-    #     },
-    # )
-    
-    # # ========== 髋关节 Yaw (L3/R3) 防内八惩罚 ==========
-    # # L3/R3 是髋关节偏航, axis=(0,0,1), 默认值 L3=-0.287, R3=0.287
-    # # 转弯时需要较大幅度运动, 其他情况保持默认位置附近
-    # # 内八方向死区更紧: 正常方向 deadzone, 内八方向 deadzone * 0.4
-    # #   L3 内八 = 偏差<0 (toein_sign=-1), R3 内八 = 偏差>0 (toein_sign=+1)
-    # hip_yaw_penalty = RewTerm(
-    #     func=mdp.hip_yaw_conditional_penalty,
-    #     weight=-5.0,
-    #     params={
-    #         "deadzone_base": 0.2,            # 直行时的基础死区 (rad, ≈8.6°)
-    #         "deadzone_max": 0.5,              # 转弯时的最大死区 (rad, ≈28.6°)
-    #         "vel_threshold": 0.8,             # 角速度阈值 (rad/s), 达到此值死区最大
-    #         "toein_deadzone_ratio": 0.4,      # 内八方向死区 = 基础死区 × 0.4 (更严格)
-    #         "toein_signs": [-1.0, 1.0],       # L3 内八=-1, R3 内八=+1
-    #         "asset_cfg": SceneEntityCfg(
-    #             "robot",
-    #             joint_names=["leg_l3_joint", "leg_r3_joint"],
-    #         ),
-    #     },
-    # )
-    
-    # # ========== 膝盖 Pitch (L4/R4) 限位惩罚 ==========
-    # # 膝盖关节 axis=(0,1,0), 限位=[0.0, 2.618], 默认=0.5rad
-    # # 正常走路时膝盖在默认值附近 ±0.5rad (0.0~1.0rad) 范围内弯曲/伸展
-    # # 超出此范围则惩罚，防止膝盖过度弯曲或完全伸直锁死
-    # knee_pitch_penalty = RewTerm(
-    #     func=mdp.deadzone_penalty,
-    #     weight=-5.0,
-    #     params={
-    #         "deadzone": 0.3,  # 允许默认值±0.5rad(约28.6°)的偏移
-    #         "asset_cfg": SceneEntityCfg(
-    #             "robot",
-    #             joint_names=["leg_l4_joint", "leg_r4_joint"],
-    #         ),
-    #     },
-    # )
-    
-    # ========== 两脚距离惩罚 ==========
-    # 惩罚两脚之间 3D 距离 < 20cm（太近/交叉）或 > 32cm（太远/劈叉）
-    # 在 [20cm, 32cm] 范围内无惩罚
     feet_distance = RewTerm(
         func=mdp.feet_distance_penalty,
-        weight=-30.0,
+        weight=-0.2,
         params={
-            "min_dist": 0.22,  # 最小允许距离 (m)
-            "max_dist": 0.30,  # 最大允许距离 (m)
-            "asset_cfg": SceneEntityCfg(
-                "robot",
-                body_names=["leg_l6_link", "leg_r6_link"],
-            ),
+            "min_dist": 0.22,
+            "max_dist": 0.30,
+            "asset_cfg": SceneEntityCfg("robot", body_names=["leg_l6_link", "leg_r6_link"]),
         },
     )
 
-    # ========== 对称性奖励 (Symmetry Rewards) ==========
-    # 左右脚触地时间对称性：鼓励左右脚触地时间一致，防止瘸腿
+    # ─── 2. Gait Stylers (POSITIVE, 高斯核，目标滞空随速度线性变化) ───
+    # 速度 0.3→目标滞空 0.5s，0.6→0.3s；指令<0.25 不抬腿；超过 0.5/0.3 时奖励封顶为目标分
+    feet_air_time = RewTerm(
+        func=mdp.feet_air_time_exp_speed_adaptive,
+        weight=1.0,
+        params={
+            "target_air_at_speed_low": 0.5,
+            "target_air_at_speed_high": 0.3,
+            "speed_low": 0.3,
+            "speed_high": 0.6,
+            "min_cmd_speed": 0.25,
+            "std": 0.08,
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
+        },
+    )
+
     feet_contact_time_symmetry = RewTerm(
         func=mdp.feet_contact_time_symmetry_exp,
-        weight=1.6,
+        weight=1.0,
         params={
             "sigma": 0.25,
             "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
         },
     )
 
-    # ========== 静止惩罚（Stand Still Penalty）==========
-    # 当指令落在统一死区内时，惩罚关节运动，迫使机器人像雕塑一样完全静止。
-    # 与步态奖励的死区门控配合：有指令→步态奖励生效；无指令→静止惩罚生效。
-    stand_still_penalty = RewTerm(
-        func=mdp.stand_still_penalty,
-        weight=-2.0,
-        params={
-            "joint_vel_threshold": 0.1,
-            "asset_cfg": SceneEntityCfg("robot"),
-        },
-    )
-
-    # # 关节位置对称性：惩罚左右关节位置不对称（代替 FFT 对称性分析的简化版本）
-    # joint_pos_symmetry = RewTerm(
-    #     func=mdp.joint_pos_symmetry_l2,
-    #     weight=-0.5,
-    #     params={},
-    # )
-
-    # # 关节速度对称性：惩罚左右关节速度不对称
-    # joint_vel_symmetry = RewTerm(
-    #     func=mdp.joint_vel_symmetry_l2,
-    #     weight=-0.001,
-    #     params={},
-    # )
+    # ─── REMOVED/DISABLED ───
+    # stand_still_penalty, dof_vel_limits, lin_vel_z_l2, ang_vel_xy_l2, stumble, feet_force
+    # step_frequency, feet_height, straight_knee_landing, soft_landing, root_height_maintain
 
 
 @configclass

@@ -388,6 +388,24 @@ def body_orientation_l2(
     return torch.sum(torch.square(body_orientation[:, :2]), dim=1)
 
 
+def feet_orientation_l2(
+    env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """Penalty for foot orientation deviation from horizontal (anti-edge-walking/tiptoeing).
+
+    Sum of L2 orientation error over all bodies in asset_cfg (e.g. left and right foot).
+    Use with negative weight.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    total = torch.zeros(env.num_envs, device=asset.data.body_quat_w.device)
+    for bid in asset_cfg.body_ids:
+        body_orientation = math_utils.quat_rotate_inverse(
+            asset.data.body_quat_w[:, bid, :], asset.data.GRAVITY_VEC_W
+        )
+        total = total + torch.sum(torch.square(body_orientation[:, :2]), dim=1)
+    return total
+
+
 def feet_stumble(env: BaseEnv | TienKungEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
     return torch.any(
@@ -749,6 +767,66 @@ def feet_air_time_clip_biped(
     return reward
 
 
+def feet_air_time_exp(
+    env: BaseEnv,
+    target_air_time: float = 0.2,
+    std: float = 0.08,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
+) -> torch.Tensor:
+    """滞空时间的高斯核奖励（固定目标）：着地瞬间对上一段滞空时长给高斯奖励。
+
+    reward = exp(-(last_air_time - target_air_time)^2 / std^2)，仅在着地瞬间、有指令时给奖。
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    first_contact = contact_sensor.compute_first_contact(env.step_dt)[:, sensor_cfg.body_ids]
+    last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
+
+    err_sq = torch.square(last_air_time - target_air_time)
+    gaussian = torch.exp(-err_sq / (std**2)) * first_contact
+    reward = torch.sum(gaussian, dim=1)
+
+    has_command = (
+        torch.norm(env.command_generator.command[:, :2], dim=1)
+        + torch.abs(env.command_generator.command[:, 2])
+    ) > 0.1
+    return reward * has_command.float()
+
+
+def feet_air_time_exp_speed_adaptive(
+    env: BaseEnv,
+    target_air_at_speed_low: float = 0.5,
+    target_air_at_speed_high: float = 0.3,
+    speed_low: float = 0.3,
+    speed_high: float = 0.6,
+    min_cmd_speed: float = 0.25,
+    std: float = 0.08,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
+) -> torch.Tensor:
+    """滞空时间的高斯核奖励，目标滞空随指令速度线性变化（甜点区）。
+
+    - 速度 = speed_low (0.3) 时目标滞空 = 0.5s；速度 = speed_high (0.6) 时目标滞空 = 0.3s。
+    - 速度指令 < min_cmd_speed (0.25) 时不要求抬腿，不给奖励。
+    - 抬腿时间超过目标（0.5 或 0.3）时，奖励封顶为目标对应的值（不再额外给，但给满目标分）。
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    first_contact = contact_sensor.compute_first_contact(env.step_dt)[:, sensor_cfg.body_ids]
+    last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
+
+    cmd_speed = torch.norm(env.command_generator.command[:, :2], dim=1)
+    t = ((cmd_speed - speed_low) / (speed_high - speed_low)).clamp(0.0, 1.0)
+    target_air_time = target_air_at_speed_low - (target_air_at_speed_low - target_air_at_speed_high) * t
+    target_air_time = target_air_time.unsqueeze(1)  # [num_envs, 1]
+
+    # 超过目标滞空时按目标算，奖励封顶为“目标滞空”对应的分数（等价于滞空=0.5或0.3时给满）
+    effective_air_time = torch.minimum(last_air_time, target_air_time)
+    err_sq = torch.square(effective_air_time - target_air_time)
+    gaussian = torch.exp(-err_sq / (std**2)) * first_contact
+
+    reward = torch.sum(gaussian, dim=1)
+    has_command = cmd_speed >= min_cmd_speed
+    return reward * has_command.float()
+
+
 def step_frequency_penalty(
     env: BaseEnv,
     max_grounded_time: float = 0.2,
@@ -866,6 +944,61 @@ def feet_contact_time_symmetry_exp(
         # + torch.abs(env.command_generator.command[:, 2])  #暂时不考虑转圈时的表现
     ) > 0.1
     return reward * has_command
+
+
+def root_height_maintain(
+    env: BaseEnv | TienKungEnv,
+    min_height: float = 0.6,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward for maintaining root (base) height above a minimum threshold.
+
+    当根节点高度 >= min_height 时奖励为 1（满分），
+    低于 min_height 时按比例衰减：reward = (h / min_height)^2，
+    高度越低惩罚越重，激励机器人保持直立行走姿态。
+
+    返回 shape: (num_envs,)，值域 [0, 1]。
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    root_height = asset.data.root_pos_w[:, 2]  # z 坐标
+
+    reward = torch.where(
+        root_height >= min_height,
+        torch.ones_like(root_height),
+        (root_height / min_height).clamp(min=0.0).square(),
+    )
+    return reward
+
+
+def base_height_penalty(
+    env: BaseEnv | TienKungEnv,
+    min_height: float = 0.6,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalty when base height is below min_height (e.g. squatting or falling).
+
+    penalty = (min_height - h)^2 when h < min_height, else 0.
+    Use with negative weight so that below 0.6m incurs negative reward.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    h = asset.data.root_pos_w[:, 2]
+    shortfall = (min_height - h).clamp(min=0.0)
+    return torch.square(shortfall)
+
+
+def flat_orientation_exp(
+    env: BaseEnv | TienKungEnv,
+    std: float = 0.25,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Positive Gaussian reward for flat base orientation (Roll=0, Pitch=0).
+
+    reward = exp(-error / std^2), where error = sum(square(projected_gravity_b[:, :2])).
+    High score when base is upright (gravity aligned with z in body frame).
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    error = torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
+    return torch.exp(-error / (std**2))
 
 
 # def joint_pos_symmetry_l2(

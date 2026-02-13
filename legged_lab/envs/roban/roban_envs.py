@@ -623,19 +623,22 @@ class RobanEnv(VecEnv):
         """计算统一死区 mask: is_command_active。
 
         指令"有效"的条件（OR 逻辑）：
-          ||cmd_xy|| > lin_vel_deadband  OR  |cmd_yaw| > ang_vel_deadband
+          |cmd_x| > lin_vel_deadband  OR  |cmd_y| > lat_vel_deadband  OR  |cmd_yaw| > ang_vel_deadband
 
         效果：
           - is_command_active = True  → 步态奖励正常生效
           - is_command_active = False → 步态奖励归零 + stand_still_penalty 生效
         """
         cur_cfg = getattr(self.cfg, "velocity_curriculum", None)
-        lin_db = getattr(cur_cfg, "lin_vel_deadband", 0.2) if cur_cfg else 0.2
-        ang_db = getattr(cur_cfg, "ang_vel_deadband", 0.2) if cur_cfg else 0.2
+        lin_db = getattr(cur_cfg, "lin_vel_deadband", 0.25) if cur_cfg else 0.25
+        lat_db = getattr(cur_cfg, "lat_vel_deadband", 0.2) if cur_cfg else 0.2
+        ang_db = getattr(cur_cfg, "ang_vel_deadband", 0.25) if cur_cfg else 0.25
 
         cmd = self.command_generator.command
         self.is_command_active = (
-            torch.norm(cmd[:, :2], dim=1) > lin_db
+            torch.abs(cmd[:, 0]) > lin_db
+        ) | (
+            torch.abs(cmd[:, 1]) > lat_db
         ) | (
             torch.abs(cmd[:, 2]) > ang_db
         )
@@ -873,9 +876,8 @@ class RobanEnv(VecEnv):
         # 记录关键奖励的当前有效权重，方便在 TensorBoard 中验证动态缩放是否生效
         tracked_names = (
             "track_lin_vel_xy_exp", "track_ang_vel_z_exp",
-            "flat_orientation_l2",
-            "feet_air_time", "step_frequency", "feet_distance",
-            "straight_knee_landing", "stand_still_penalty",
+            "flat_orientation_exp", "base_height_penalty",
+            "feet_air_time", "feet_contact_time_symmetry", "feet_distance",
         )
         for name in tracked_names:
             if name in self._reward_base_weights:
