@@ -287,7 +287,7 @@ class RobanLiteRewardCfg(LiteRewardCfg):
     )
     humanoid_swing_foot_height = RewTerm(
         func=mdp.humanoid_swing_foot_height_reward,
-        weight=0.7,  # moderate, does not dominate velocity tracking
+        weight=1.0,  # moderate, does not dominate velocity tracking
         params={
             "threshold": 10.0,
             "height_threshold": 0.05,
@@ -298,7 +298,7 @@ class RobanLiteRewardCfg(LiteRewardCfg):
     )
     humanoid_swing_foot_forward = RewTerm(
         func=mdp.humanoid_swing_foot_forward_reward,
-        weight=1.5,  # small: anti-moonwalk
+        weight=5.0,  # small: anti-moonwalk
         params={
             "threshold": 10.0,
             "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
