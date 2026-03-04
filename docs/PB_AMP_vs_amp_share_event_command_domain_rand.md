@@ -60,16 +60,18 @@
 
 ## 5. Interval 时 Event（训练中周期性触发）
 
+> 下面对比的是 **amp_share 当前实现** 与 **PB_AMP roban_walk 最新实现**（已完全对齐）。
+
 | 项目 | amp_share | PB_AMP roban_walk |
 |------|-----------|-------------------|
-| **实现** | apply_external_force_torque_stochastic：对 base 施加**力/力矩** | push_by_setting_velocity_curriculum：直接改 base **线速度**（再按课程 level 缩放） |
-| **触发间隔** | interval_range_s = (0.01, 0.3) | interval_range_s = (10.0, 15.0) |
-| **强度/范围** | force x,y,z ∈ [-100, 100]，torque ∈ [-50, 50]；probability=0.01 | velocity_range x,y ∈ (-1.0, 1.0) m/s，缩放系数 = 当前 env 的 _external_force_torque_level |
-| **与课程关系** | 与 external_force_torque_levels 课程独立（随机力/力矩） | **与地形+推力课程绑定**：同一课程更新 _external_force_torque_level，推力大小 = level × 速度扰动 |
+| **实现** | `apply_external_force_torque_stochastic`：对 base 施加**力/力矩** | **相同**：`apply_external_force_torque_stochastic` 作用于 `base_link` |
+| **触发间隔** | `interval_range_s = (0.01, 0.3)` | **相同**：`interval_range_s = (0.01, 0.3)` |
+| **强度/范围** | `force_range`: x,y,z ∈ [-100, 100]；`torque_range`: x,y,z ∈ [-50, 50]；`probability=0.01` | **相同**：完全复刻 `force_range` / `torque_range` / `probability` |
+| **与课程关系** | 与 `external_force_torque_levels` 课程配合，在 curriculum 中统计外力等级并用于 Stage Two 触发 | **相同逻辑**：PB_AMP 通过 `terrain_force_curriculum` 统一管理「地形+外力水平」，Stage Two 条件与 amp_share 对齐 |
 
 **结论**：  
-- **amp_share**：**高频率**（约 0.01–0.3 s 间隔）、**随机力/力矩**、概率 0.01，扰动形式为力。  
-- **PB_AMP**：**低频率**（10–15 s 间隔）、**速度脉冲**、强度由课程 level 线性缩放，与 terrain_force_curriculum 一致（“amp_share 推力课程同款”逻辑在 PB_AMP 的 push_by_setting_velocity_curriculum 中）。
+- 现版本 PB_AMP roban_walk 在 **外力事件的具体实现形式（函数、参数、频率、强度范围、概率）** 上已与 amp_share 的 `EventCfg.base_external_force_torque` **一字不差对齐**。  
+- 差异仅体现在 **课程封装方式**：amp_share 使用 `CurriculumCfg.external_force_torque_levels` + `stage_two`，PB_AMP 用 `TerrainForceCurriculumCfg` 将「地形 + 外力等级 + Stage Two 权重重写」打包在一起，但数值与触发条件保持一致。
 
 ---
 

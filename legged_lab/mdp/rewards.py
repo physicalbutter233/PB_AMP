@@ -878,6 +878,36 @@ def step_frequency_penalty(
     return reward
 
 
+def turning_step_frequency_reward(
+    env: BaseEnv,
+    command_name: str = "base_velocity",
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
+    velocity_threshold: float = 0.12,
+    max_grounded_time: float = 0.2,
+    penalty_scale: float = 2.0,
+) -> torch.Tensor:
+    """与 amp_roban_share 等价的转弯步频奖励。
+
+    amp_roban_share 中使用的 turning_step_frequency，本质上是对
+    \"双脚同时着地时间过长\" 的惩罚，权重为正值（10）。
+
+    这里直接复用 step_frequency_penalty 的实现与默认参数：
+    - max_grounded_time = 0.2
+    - penalty_scale = 2.0
+    - velocity_threshold = 0.12
+
+    注意：返回值为**负值惩罚**，需配合**正的 weight**（例如 10）使用。
+    """
+    # 复用前面的 step_frequency_penalty 实现，确保行为与注释保持一致
+    return step_frequency_penalty(
+        env,
+        max_grounded_time=max_grounded_time,
+        penalty_scale=penalty_scale,
+        velocity_threshold=velocity_threshold,
+        sensor_cfg=sensor_cfg,
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Humanoid Locomotion: Contact Phase Rewards (no air-time shaping)
 # Induce natural leg lifting through stable single support.

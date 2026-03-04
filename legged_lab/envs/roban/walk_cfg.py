@@ -109,12 +109,18 @@ class TerrainForceCurriculumCfg:
     def __post_init__(self):
         if self.stage_2_reward_weights is None:
             self.stage_2_reward_weights = {
+                # 完全对齐 amp_share 中 RobanS2MixEnvCfg.CurriculumCfg.stage_two 的 stage_2_reward_weight
                 "track_lin_vel_xy_exp": 4.5,
                 "track_ang_vel_z_exp": 2.25,
-                "action_rate_l2": -0.01,
+                "ang_vel_xy_l2": -4.0,
+                "ang_acc_xy_l2": -0.0001,
                 "dof_acc_l2": -1e-5,
-                "feet_contact_time_symmetry": 1.0,
-                "feet_distance_symmetry_per_cycle": 1.0,
+                "action_rate_l2": -0.01,
+                "action_smoothness_l2": -0.04,
+                "fft_dof_symmetry": 0.01,
+                "action_rate_l2_ankle_roll": -0.5,
+                "joint_deviation_ankle_roll": -0.5,
+                "stand_still_without_cmd": -1.0,
             }
 
 
@@ -417,6 +423,312 @@ class RobanLiteRewardCfg(LiteRewardCfg):
 
 
 @configclass
+class RobanAmpShareRewardCfg:
+    """与 amp_roban_share 的 RobanS2MixEnvCfg.RewardsCfg 对齐的奖励配置。
+
+    注意：将 amp_share 中的 `contact_forces` 统一映射为本工程中的 `contact_sensor`。
+    关节与刚体命名保持一致（waist_yaw, leg_l/r*, zarm_l/r*）。
+    """
+
+    # 终止惩罚
+    termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
+
+    # ---- 任务：速度跟踪 ----
+    track_lin_vel_xy_exp = RewTerm(
+        func=mdp.track_lin_vel_xy_yaw_frame_exp,
+        weight=3.5,
+        params={"command_name": "base_velocity", "std": math.sqrt(0.35)},
+    )
+    track_ang_vel_z_exp = RewTerm(
+        func=mdp.track_ang_vel_z_world_exp,
+        weight=1.55,
+        params={"command_name": "base_velocity", "std": math.sqrt(0.5)},
+    )
+
+    # ---- 步态与接触形状 ----
+    feet_height_cycle = RewTerm(
+        func=mdp.feet_height_cycle,
+        weight=12.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
+            "asset_cfg": SceneEntityCfg("robot", body_names="leg_[l,r]6_link"),
+            "max_height_clip": 0.15,
+        },
+    )
+
+    # ---- 物理代价 / 约束 ----
+    joint_vel = RewTerm(func=mdp.joint_vel_l2, weight=0.0)
+    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-1.0)
+    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-2.0)
+    ang_acc_xy_l2 = RewTerm(func=mdp.ang_acc_xy_l2, weight=-0.00005)
+    dof_power_l2 = RewTerm(func=mdp.joint_power_l2, weight=-2.0e-5)
+    dof_torques_l2 = RewTerm(
+        func=mdp.joint_torques_l2,
+        weight=-4.0e-6,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=["leg_[l,r][1-5]_joint", "zarm_.*_joint"])
+        },
+    )
+    dof_acc_l2 = RewTerm(
+        func=mdp.joint_mean_acc_l2,
+        weight=-6e-6,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+    action_smoothness_l2 = RewTerm(func=mdp.action_smoothness_l2, weight=-0.01)
+
+    undesired_contacts = RewTerm(
+        func=mdp.undesired_contacts,
+        weight=-1.0,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "contact_sensor", body_names=["leg_[l,r][1-5]_link", "base_link", "zarm_.*_link"]
+            ),
+            "threshold": 1.0,
+        },
+    )
+
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-5.0)
+    flat_orientation_l2_exp = RewTerm(
+        func=mdp.orientation_l2,
+        weight=0.5,
+        params={
+            "desired_gravity": (0.05, 0.0, -0.99875),
+            "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+            "std": 0.0001,
+        },
+    )
+    dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-8.0)
+    dof_vel_limits = RewTerm(
+        func=mdp.joint_vel_limits,
+        weight=-10.0,
+        params={"soft_ratio": 0.9},
+    )
+
+    # 腰部偏移惩罚
+    joint_deviation_arms = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-0.5,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["waist_yaw_joint"],
+            )
+        },
+    )
+
+    # ---- 接触/力相关约束 ----
+    contact_momentum = RewTerm(
+        func=mdp.contact_momentum,
+        weight=0.25,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
+        },
+    )
+    contact_force = RewTerm(
+        func=mdp.contact_forces,
+        weight=-0.001,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
+            "threshold": 350.0,
+            "violation_max": 300.0,
+            "violation_min": 0.0,
+        },
+    )
+
+    # ---- 静止与站立质量 ----
+    gravity_aligned_when_stopping = RewTerm(
+        func=mdp.gravity_aligned_when_stopping,
+        weight=0.5,
+        params={
+            "command_name": "base_velocity",
+            "std": 0.05,
+        },
+    )
+    stand_still_without_cmd = RewTerm(
+        func=mdp.stand_still_without_cmd,
+        weight=-0.3,
+        params={"command_name": "base_velocity"},
+    )
+    feet_parallel_when_standing = RewTerm(
+        func=mdp.feet_parallel_when_standing,
+        weight=1.0,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": SceneEntityCfg("robot", body_names="leg_[l,r]6_link"),
+            "std": 0.02,
+        },
+    )
+
+    # ---- 步态风格 / 频率 / 对称性 ----
+    turning_step_frequency = RewTerm(
+        func=mdp.turning_step_frequency_reward,
+        weight=10.0,
+        params={
+            "command_name": "base_velocity",
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
+            "velocity_threshold": 0.12,
+        },
+    )
+    contact_ground_straight_knee = RewTerm(
+        func=mdp.contact_ground_straight_knee,
+        weight=1.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=["leg_[l,r]4_joint"],
+            ),
+            "std": 0.3,
+        },
+    )
+    joint_deviation_ankle_roll = RewTerm(
+        func=mdp.joint_deviation_l1_straight_only,
+        weight=-0.5,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=["leg_[l,r]6_joint"]),
+        },
+    )
+    action_rate_l2_ankle_roll = RewTerm(
+        func=mdp.joint_vel_l2,
+        weight=-0.5,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["leg_[l,r]6_joint"])},
+    )
+    fft_dof_symmetry = RewTerm(
+        func=mdp.fft_dof_symmetry,
+        weight=0.001,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "joint_names_pairs": [
+                "leg_[l,r]6_joint",
+                "leg_[l,r]5_joint",
+                "leg_[l,r]4_joint",
+                "leg_[l,r]3_joint",
+                "zarm_[l,r]1_joint",
+                "zarm_[l,r]4_joint",
+            ],
+            "angular_threshold": 0.8,
+            "command_name": "base_velocity",
+        },
+    )
+    feet_y_distance = RewTerm(func=mdp.feet_y_distance, weight=-1.0)
+    feet_air_time = RewTerm(
+        func=mdp.feet_air_time_clip,
+        weight=10.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
+            "command_name": "base_velocity",
+            "threshold_min": 0.25,
+            "threshold_max": 0.45,
+        },
+    )
+    joint_deviation_hip_roll = RewTerm(
+        func=mdp.joint_deviation_l1_straight_only,
+        weight=-0.0,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["leg_[l,r]2_joint"])},
+    )
+    action_rate_l2_hip_roll = RewTerm(
+        func=mdp.joint_vel_l2,
+        weight=-0.0,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["leg_[l,r]2_joint"])},
+    )
+    joint_deviation_knee_yaw = RewTerm(
+        func=mdp.joint_deviation_l1_straight_only,
+        weight=-0.0,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["leg_[l,r]3_joint"])},
+    )
+    action_rate_l2_hip_yaw = RewTerm(
+        func=mdp.joint_vel_l2,
+        weight=-0.0,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["leg_[l,r]3_joint"])},
+    )
+    feet_slide_vel = RewTerm(
+        func=mdp.feet_slide,
+        weight=-1.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
+            "asset_cfg": SceneEntityCfg("robot", body_names="leg_[l,r]6_link"),
+        },
+    )
+    feet_slide_yaw = RewTerm(
+        func=mdp.feet_slide_yaw,
+        weight=-0.8,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
+            "asset_cfg": SceneEntityCfg("robot", body_names="leg_[l,r]6_link"),
+            "command_name": "base_velocity",
+        },
+    )
+    feet_pos_acc_l2 = RewTerm(
+        func=mdp.feet_pos_acc_l2,
+        weight=-0.0001,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=["leg_[l,r]6_link"])},
+    )
+    knee_pos_acc_l2 = RewTerm(
+        func=mdp.knee_pos_acc_l2,
+        weight=-0.0003,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=["leg_[l,r]4_link"])},
+    )
+    knee_pos_z_limit = RewTerm(
+        func=mdp.knee_pos_z_limit,
+        weight=-3.0,
+        params={"asset_cfg": SceneEntityCfg("robot", body_names=["leg_[l,r]4_link"]), "knee_z_limit": 0.58},
+    )
+    knee_ankle_y_position_difference = RewTerm(
+        func=mdp.knee_ankle_y_position_difference,
+        weight=-1.0,
+        params={
+            "knee_cfg": SceneEntityCfg("robot", body_names=["leg_[l,r]4_link"]),
+            "ankle_cfg": SceneEntityCfg("robot", body_names=["leg_[l,r]6_link"]),
+        },
+    )
+    foot_lift_during_rotation = RewTerm(
+        func=mdp.foot_lift_height_during_rotation,
+        weight=0.5,
+        params={
+            "command_name": "base_velocity",
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
+            "asset_cfg": SceneEntityCfg("robot", body_names="leg_[l,r]6_link"),
+            "target_height": 0.08,
+            "height_tolerance": 0.02,
+            "rotation_threshold": 0.1,
+            "linear_threshold": 0.1,
+            "max_air_time": 0.2,
+        },
+    )
+    feet_contact_time_symmetry_exp = RewTerm(
+        func=mdp.feet_contact_time_symmetry_exp,
+        weight=1.6,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
+            "command_name": "base_velocity",
+            "degree": 5,
+            "std": 0.1,
+        },
+    )
+    knee_joint_yaw_contact_only = RewTerm(
+        func=mdp.knee_joint_yaw_contact_only,
+        weight=-0.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
+            "joint_names": ["leg_l3_joint", "leg_r3_joint"],
+            "angular_threshold": 0.1,
+            "linear_threshold": 0.1,
+        },
+    )
+    stand_static_vel_without_cmd = RewTerm(
+        func=mdp.stand_static_vel_without_cmd,
+        weight=-0.1,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": SceneEntityCfg("robot"),
+            "cmd_threshold": 0.05,
+            "ext_force_threshold": 10.0,
+        },
+    )
+
+
+@configclass
 class RobanWalkFlatEnvCfg:
     """与 amp_share (RobanS2MixEnvCfg) 一致：地形课程 + 推力课程，无速度课程；外力>=0.9 时 stage two 权重重写。"""
     amp_motion_files_display = ["legged_lab/envs/roban/datasets/motion_visualization/walk_pb_easy_nowrist.txt"]
@@ -449,7 +761,8 @@ class RobanWalkFlatEnvCfg:
         # 与 amp_roban_share 一致：根部高度低于 0.35m 时终止（真正摔倒）
         terminate_min_height=0.35,
     )
-    reward = RobanLiteRewardCfg()
+    # 使用与 amp_share RobanS2MixEnvCfg.RewardsCfg 对齐的奖励配置
+    reward = RobanAmpShareRewardCfg()
     gait = GaitCfg()
     normalization: NormalizationCfg = NormalizationCfg(
         obs_scales=ObsScalesCfg(
@@ -579,12 +892,25 @@ class RobanWalkFlatEnvCfg:
                     "velocity_range": (0.0, 0.0),
                 },
             ),
-            # Interval 推力：使用与 base_config 相同的速度脉冲形式，但频率对齐 amp_share
-            push_robot=EventTerm(
-                func=mdp.push_by_setting_velocity,
+            # Interval 外力事件：完全对齐 amp_share EventCfg.base_external_force_torque
+            base_external_force_torque=EventTerm(
+                func=mdp.apply_external_force_torque_stochastic,
                 mode="interval",
                 interval_range_s=(0.01, 0.3),
-                params={"velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)}},
+                params={
+                    "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
+                    "force_range": {
+                        "x": (-100.0, 100.0),
+                        "y": (-100.0, 100.0),
+                        "z": (-100.0, 100.0),
+                    },
+                    "torque_range": {
+                        "x": (-50.0, 50.0),
+                        "y": (-50.0, 50.0),
+                        "z": (-50.0, 50.0),
+                    },
+                    "probability": 0.01,
+                },
             ),
         ),
         action_delay=ActionDelayCfg(enable=False, params={"max_delay": 5, "min_delay": 0}),
