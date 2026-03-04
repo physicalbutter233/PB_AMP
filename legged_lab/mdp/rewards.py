@@ -1011,6 +1011,46 @@ def humanoid_swing_foot_forward_reward(
     return reward * single_support.float() * has_command.float()
 
 
+def humanoid_swing_foot_lateral_penalty(
+    env: BaseEnv | TienKungEnv,
+    max_lateral_offset: float = 0.18,
+    threshold: float = 10.0,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """单支撑时严重惩罚摆动脚横向偏离重心投影（不超过肩宽一半，防圆规步态）。
+
+    - 仅在单支撑时生效；只约束当前摆动脚。
+    - 重心投影 = root_pos 的 xy；在 yaw 系下横向 = y 分量（左右）。
+    - 若 |swing_foot_y_in_yaw| > max_lateral_offset，则对超出部分做二次惩罚。
+    - max_lateral_offset 建议约肩宽一半，如 0.18m。
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    asset: Articulation = env.scene[asset_cfg.name]
+    net_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    in_contact = torch.norm(net_forces, dim=-1) > threshold  # [batch, 2], True=着地
+    num_contacts = torch.sum(in_contact.int(), dim=1)
+    single_support = num_contacts == 1
+    has_command = (
+        torch.norm(env.command_generator.command[:, :2], dim=1)
+        + torch.abs(env.command_generator.command[:, 2])
+    ) > 0.1
+
+    root_pos = asset.data.root_pos_w[:, :3]
+    root_quat = asset.data.root_quat_w
+    yaw_quat = math_utils.yaw_quat(root_quat)
+    feet_pos = asset.data.body_pos_w[:, asset_cfg.body_ids, :]  # [batch, 2, 3]
+    rel_w = feet_pos - root_pos.unsqueeze(1)  # [batch, 2, 3] world
+    rel_yaw_0 = math_utils.quat_rotate_inverse(yaw_quat, rel_w[:, 0, :])  # [batch, 3]
+    rel_yaw_1 = math_utils.quat_rotate_inverse(yaw_quat, rel_w[:, 1, :])
+    lateral = torch.stack([rel_yaw_0[:, 1], rel_yaw_1[:, 1]], dim=1)  # [batch, 2] 横向 = y in yaw
+    excess = (torch.abs(lateral) - max_lateral_offset).clamp(min=0.0)  # [batch, 2]
+    penalty_per_foot = torch.square(excess)
+    swing_penalty = torch.where(in_contact, torch.zeros_like(penalty_per_foot), penalty_per_foot)
+    penalty = torch.sum(swing_penalty, dim=1)
+    return penalty * single_support.float() * has_command.float()
+
+
 def humanoid_single_support_duration_penalty(
     env: BaseEnv | TienKungEnv,
     max_duration: float = 0.4,
@@ -1112,6 +1152,33 @@ def feet_contact_time_symmetry_exp(
         # + torch.abs(env.command_generator.command[:, 2])  #暂时不考虑转圈时的表现
     ) > 0.1
     return reward * has_command
+
+
+def feet_distance_symmetry_per_cycle_exp(
+    env: BaseEnv,
+    sigma: float = 0.1,
+    min_stride: float = 0.05,
+) -> torch.Tensor:
+    """奖励「一个步态周期内两只脚移动距离相近」。
+
+    使用环境在步态周期回绕时记录的 _last_cycle_foot_distance（左右脚在上一个
+    完整周期内的位移），计算 reward = exp(-(dist_L - dist_R)^2 / sigma^2)。
+    仅在至少完成一个步态周期且两脚都有有效位移时生效；有速度指令时激活。
+
+    适用于具有 _last_cycle_foot_distance、_feet_pos_at_cycle_start 等缓冲区的环境（如 RobanEnv）。
+    """
+    if not hasattr(env, "_last_cycle_foot_distance"):
+        return torch.zeros(env.num_envs, device=env.device)
+    dist = env._last_cycle_foot_distance
+    diff = dist[:, 0] - dist[:, 1]
+    reward = torch.exp(-torch.square(diff) / (sigma**2))
+    valid = (dist[:, 0] >= min_stride) & (dist[:, 1] >= min_stride)
+    reward = reward * valid.float()
+    has_command = (
+        torch.norm(env.command_generator.command[:, :2], dim=1)
+        + torch.abs(env.command_generator.command[:, 2])
+    ) > 0.1
+    return reward * has_command.float()
 
 
 def root_height_maintain(

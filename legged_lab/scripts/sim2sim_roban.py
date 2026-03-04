@@ -27,10 +27,23 @@ import torch
 from pynput import keyboard
 import time
 
+# 策略观测/动作的 21 维顺序，必须与 Isaac Lab 中 robot.data.joint_pos 顺序一致（roban_envs 里
+# compute_current_observations 用的就是该顺序）；若不一致会导致 policy 输出错位。
+ISAAC_JOINT_NAMES_21 = (
+    "waist_yaw_joint",
+    "leg_l1_joint", "leg_l2_joint", "leg_l3_joint", "leg_l4_joint", "leg_l5_joint", "leg_l6_joint",
+    "leg_r1_joint", "leg_r2_joint", "leg_r3_joint", "leg_r4_joint", "leg_r5_joint", "leg_r6_joint",
+    "zarm_l1_joint", "zarm_l2_joint", "zarm_l3_joint", "zarm_l4_joint",
+    "zarm_r1_joint", "zarm_r2_joint", "zarm_r3_joint", "zarm_r4_joint",
+)
+
+
 class SimToSimCfg:
     """Configuration class for sim2sim parameters.
 
-    Must be kept consistent with the training configuration.
+    Must be kept consistent with the training configuration (walk_cfg.py).
+    Robot init state (default_dof_pos, base height 0.68) follows
+    legged_lab/assets/roban_s14/roban_s14.py ROBAN_S14_CFG.
     """
 
     class sim:
@@ -42,7 +55,7 @@ class SimToSimCfg:
         decimation = 4
         clip_observations = 100.0
         clip_actions = 100.0
-        action_scale = 0.25  # Roban uses 0.25
+        action_scale = 0.5  # 与 walk_cfg 的 robot.action_scale 对齐
 
     class robot:
         gait_air_ratio_l: float = 0.38
@@ -50,6 +63,20 @@ class SimToSimCfg:
         gait_phase_offset_l: float = 0.38
         gait_phase_offset_r: float = 0.88
         gait_cycle: float = 0.85
+        # PD 增益：与 roban_s14.py DelayedPDActuatorCfg_RobanS2 的 stiffness/damping 一致（Isaac Lab 关节顺序，21 维）
+        stiffness: tuple = (
+            40.1792, 40.1792, 99.0984, 40.1792, 99.0984, 14.2506, 14.2506,  # waist, leg_l1-6
+            40.1792, 99.0984, 40.1792, 99.0984, 14.2506, 14.2506,          # leg_r1-6
+            14.2506, 14.2506, 14.2506, 14.2506,                            # zarm_l1-4
+            14.2506, 14.2506, 14.2506, 14.2506,                           # zarm_r1-4
+        )
+        damping: tuple = (
+            2.5579, 2.5579, 6.3088, 2.5579, 6.3088, 0.9072, 0.9072,
+            2.5579, 6.3088, 2.5579, 6.3088, 0.9072, 0.9072,
+            0.9072, 0.9072, 0.9072, 0.9072,
+            0.9072, 0.9072, 0.9072, 0.9072,
+        )
+        kp_scale_sim2sim: float = 1  # MuJoCo 下缩小 Kp 避免过冲蜷缩，Kd 按 sqrt(scale) 缩放
 
 
 class MujocoRunner:
@@ -63,8 +90,15 @@ class MujocoRunner:
         model_path (str): Path to the MuJoCo XML model.
     """
 
-    def __init__(self, cfg: SimToSimCfg, policy_path, model_path):
+    def __init__(self, cfg: SimToSimCfg, policy_path, model_path, zero_action: bool = False, right_flip: bool = False, left_flip: bool = False, flip_knees: bool = False, flip_arm_end: bool = False, hold_pose: bool = False, skip_viewer: bool = False):
         self.cfg = cfg
+        self.zero_action = zero_action
+        self.right_flip = right_flip
+        self.left_flip = left_flip
+        self.flip_knees = flip_knees
+        self.flip_arm_end = flip_arm_end
+        self.hold_pose = hold_pose  # 每步强制 qpos/qvel=default、ctrl=0，不积分，仅看 default 在 MuJoCo 里长什么样
+        self.skip_viewer = skip_viewer  # 仅打印关节顺序等时可不创建 viewer
         network_path = policy_path
         
         # Check if the provided path is a checkpoint (model_*.pt) instead of exported policy
@@ -83,25 +117,31 @@ class MujocoRunner:
         self.model = mujoco.MjModel.from_xml_path(model_path)
         self.model.opt.timestep = self.cfg.sim.dt
 
-        try:
-            self.policy = torch.jit.load(network_path)
-        except RuntimeError as e:
-            if "constants.pkl" in str(e) or "file not found" in str(e):
-                print(f"[ERROR] 无法加载策略文件: {network_path}")
-                print(f"[ERROR] 这看起来不是一个有效的 TorchScript 导出文件")
-                checkpoint_dir = os.path.dirname(network_path)
-                exported_policy = os.path.join(checkpoint_dir, "exported", "policy.pt")
-                if os.path.isfile(exported_policy):
-                    print(f"[INFO] 找到导出的策略文件: {exported_policy}")
-                    print(f"[INFO] 请使用: --policy {exported_policy}")
+        if zero_action or hold_pose or skip_viewer:
+            self.policy = None
+        else:
+            try:
+                self.policy = torch.jit.load(network_path)
+            except RuntimeError as e:
+                if "constants.pkl" in str(e) or "file not found" in str(e):
+                    print(f"[ERROR] 无法加载策略文件: {network_path}")
+                    print(f"[ERROR] 这看起来不是一个有效的 TorchScript 导出文件")
+                    checkpoint_dir = os.path.dirname(network_path)
+                    exported_policy = os.path.join(checkpoint_dir, "exported", "policy.pt")
+                    if os.path.isfile(exported_policy):
+                        print(f"[INFO] 找到导出的策略文件: {exported_policy}")
+                        print(f"[INFO] 请使用: --policy {exported_policy}")
+                    else:
+                        print(f"[INFO] 请先运行 play.py 导出策略文件")
+                    raise
                 else:
-                    print(f"[INFO] 请先运行 play.py 导出策略文件")
-                raise
-            else:
-                raise
+                    raise
         self.data = mujoco.MjData(self.model)
-        self.viewer = mujoco_viewer.MujocoViewer(self.model, self.data)
-        self.viewer._render_every_frame = False
+        if not skip_viewer:
+            self.viewer = mujoco_viewer.MujocoViewer(self.model, self.data)
+            self.viewer._render_every_frame = False
+        else:
+            self.viewer = None
         self.init_variables()
 
     def init_variables(self) -> None:
@@ -173,9 +213,9 @@ class MujocoRunner:
             # Skip right_wrist_joint (MuJoCo index 22)
         ]
 
-        # 直接硬编码初始关节位置（与 roban_s14.py 对齐）
-        # 这里的是isaac lab顺序，要转成mujoco顺序（即用isaac_to_mujoco_idx）
-        # 注意：MuJoCo 模型可能包含手腕关节，需要跳过
+        # 初始关节位置：与 legged_lab/assets/roban_s14/roban_s14.py 中
+        # ROBAN_S14_CFG.init_state.joint_pos 严格一致（Isaac Lab 关节顺序）。
+        # MuJoCo 控制时按 isaac_to_mujoco_idx 映射，手腕关节在 XML 中存在则跳过。
         self.default_dof_pos = np.array([
             0.0,    # waist_yaw_joint
             -0.412, # leg_l1_joint
@@ -204,11 +244,81 @@ class MujocoRunner:
         assert len(self.mujoco_to_isaac_idx) == self.cfg.sim.num_action
         assert len(self.isaac_to_mujoco_idx) == self.cfg.sim.num_action
 
+        # PD 增益：与 roban_s14.py 一致，但 MuJoCo 步长下易过冲，默认缩放到 0.5
+        kp_scale = getattr(self.cfg.robot, "kp_scale_sim2sim", 0.5)
+        self.stiffness = np.array(self.cfg.robot.stiffness, dtype=np.float64) * kp_scale
+        self.damping = np.array(self.cfg.robot.damping, dtype=np.float64) * np.sqrt(kp_scale)
+        assert len(self.stiffness) == self.cfg.sim.num_action and len(self.damping) == self.cfg.sim.num_action
+
+        # 关节传感器在 sensordata 中的索引（与 get_obs 一致，用于每步更新 dof_pos/dof_vel）
+        self._joint_pos_sensor_slice = slice(16, 16 + 21)   # 21 个 joint_pos，顺序已是 waist,leg_l,leg_r,zarm_l,zarm_r
+        self._joint_vel_sensor_slice = slice(37, 37 + 21)   # 21 个 joint_vel，但 XML 里顺序为 leg_l,leg_r,waist,zarm_l,zarm_r
+        # 将 MuJoCo joint_vel 传感器顺序 → Isaac 顺序 (waist, leg_l1-6, leg_r1-6, zarm_l1-4, zarm_r1-4)
+        self._joint_vel_sensor_to_isaac = np.array(
+            [12, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20], dtype=np.intp
+        )
+        # 左/右腿、左/右臂符号：默认不翻转；若 MuJoCo 轴与 Isaac 相反可加 --left-flip / --right-flip
+        self._joint_sign_isaac_from_mujoco = np.ones(self.cfg.sim.num_action, dtype=np.float64)
+        if self.left_flip:
+            self._joint_sign_isaac_from_mujoco[1:7] = -1.0    # left leg
+            self._joint_sign_isaac_from_mujoco[13:17] = -1.0  # left arm
+        if self.right_flip:
+            self._joint_sign_isaac_from_mujoco[7:13] = -1.0   # right leg
+            self._joint_sign_isaac_from_mujoco[17:21] = -1.0  # right arm
+        if self.flip_knees:
+            self._joint_sign_isaac_from_mujoco[4] *= -1.0   # leg_l4 膝
+            self._joint_sign_isaac_from_mujoco[10] *= -1.0  # leg_r4 膝
+        if self.flip_arm_end:
+            self._joint_sign_isaac_from_mujoco[15] *= -1.0   # zarm_l3
+            self._joint_sign_isaac_from_mujoco[16] *= -1.0  # zarm_l4
+            self._joint_sign_isaac_from_mujoco[19] *= -1.0   # zarm_r3
+            self._joint_sign_isaac_from_mujoco[20] *= -1.0  # zarm_r4
+
+        # 直接从 data.qpos / data.qvel 按关节顺序读取（Isaac 顺序，跳过手腕）
+        # MuJoCo: id 0=freejoint, 1=waist, 2-7=leg_l, 8-13=leg_r, 14-17=zarm_l, 18=left_wrist, 19-22=zarm_r, 23=right_wrist
+        # 21 关节取：1,2..13, 14,15,16,17, 19,20,21,22（跳过 18/23 手腕）
+        mujoco_joint_ids_isaac = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22]
+        self._qpos_adr = np.array([self.model.jnt_qposadr[jid] for jid in mujoco_joint_ids_isaac], dtype=np.intp)
+        self._qvel_adr = np.array([self.model.jnt_dofadr[jid] for jid in mujoco_joint_ids_isaac], dtype=np.intp)
+
         # Initial command vel
         self.command_vel = np.array([0.0, 0.0, 0.0])
         self.obs_history = np.zeros(
             (self.cfg.sim.num_obs_per_step * self.cfg.sim.actor_obs_history_length,), dtype=np.float32
         )
+
+    def _read_dof_from_state(self) -> None:
+        """从 data.qpos / data.qvel 按 Isaac 顺序读取 21 个关节的位置与速度（跳过手腕）。"""
+        for i in range(self.cfg.sim.num_action):
+            self.dof_pos[i] = self.data.qpos[self._qpos_adr[i]]
+            self.dof_vel[i] = self.data.qvel[self._qvel_adr[i]]
+
+    def _reset_to_default_pose(self) -> None:
+        """将仿真状态设为 default 站立姿，避免从全 0 关节被 PD 拉崩。"""
+        # 基座：位置 (0, 0, 0.68)；MuJoCo freejoint 四元数为 (w,x,y,z)，单位 (1,0,0,0)
+        self.data.qpos[0:3] = [0.0, 0.0, 0.68]
+        self.data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+        self.data.qvel[0:6] = 0.0
+        # 21 个关节：Isaac default 转为 MuJoCo 约定后写入
+        default_mujoco = self.default_dof_pos * self._joint_sign_isaac_from_mujoco
+        for i in range(self.cfg.sim.num_action):
+            self.data.qpos[self._qpos_adr[i]] = default_mujoco[i]
+            self.data.qvel[self._qvel_adr[i]] = 0.0
+        # 手腕关节保持 0（MuJoCo id 18=left_wrist, 23=right_wrist）
+        wrist_jids = [18, 23]
+        if all(jid < self.model.njnt for jid in wrist_jids):
+            for jid in wrist_jids:
+                adr = self.model.jnt_qposadr[jid]
+                dofadr = self.model.jnt_dofadr[jid]
+                self.data.qpos[adr] = 0.0
+                self.data.qvel[dofadr] = 0.0
+        mujoco.mj_forward(self.model, self.data)
+
+    def _pin_base_to_default(self) -> None:
+        """仅将基座位置/姿态/速度复位到默认，用于零策略模式下固定基座，避免整机倾倒。"""
+        self.data.qpos[0:3] = [0.0, 0.0, 0.68]
+        self.data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
+        self.data.qvel[0:6] = 0.0
 
     def get_obs(self) -> np.ndarray:
         """
@@ -217,33 +327,24 @@ class MujocoRunner:
         Returns:
             np.ndarray: Normalized and clipped observation history.
         """
-        # 从 MuJoCo 传感器数据中获取关节位置和速度
-        # 传感器顺序：BodyAcc(3), BodyVel(3), BodyGyro(3), BodyPos(3), BodyQuat(4), 
-        #           21个joint_pos, 21个joint_vel
-        # 传感器索引：0-2: BodyAcc, 3-5: BodyVel, 6-8: BodyGyro, 9-11: BodyPos, 12-15: BodyQuat,
-        #            16-36: joint_pos (21个), 37-57: joint_vel (21个)
-        
-        # 获取关节位置（21个，不含手腕）
-        joint_pos_sensor_start = 16  # BodyAcc(3) + BodyVel(3) + BodyGyro(3) + BodyPos(3) + BodyQuat(4) = 16
-        joint_pos_sensor_end = joint_pos_sensor_start + 21
-        self.dof_pos = self.data.sensordata[joint_pos_sensor_start:joint_pos_sensor_end]
-        
-        # 获取关节速度（21个，不含手腕）
-        joint_vel_sensor_start = 37  # 16 + 21 = 37
-        joint_vel_sensor_end = joint_vel_sensor_start + 21
-        self.dof_vel = self.data.sensordata[joint_vel_sensor_start:joint_vel_sensor_end]
+        # 从 data.qpos/qvel 按关节顺序读取，与 Isaac 顺序一致，避免传感器顺序问题
+        self._read_dof_from_state()
 
         # 获取角速度和方向（从传感器）
-        ang_vel = self.data.sensor("BodyGyro").data.astype(np.double)
-        body_quat = self.data.sensor("BodyQuat").data[[1, 2, 3, 0]].astype(np.double)  # 转换为 x,y,z,w 格式
+        ang_vel = self.data.sensor("BodyGyro").data.astype(np.double).copy()
+        # MuJoCo framequat 已是 (x,y,z,w)，与 quat_rotate_inverse 一致，勿重排
+        body_quat = self.data.sensor("BodyQuat").data.astype(np.double).copy()
 
+        # 观测用 Isaac 约定：右腿/右臂从 MuJoCo 取反
+        joint_pos_isaac = self.dof_pos * self._joint_sign_isaac_from_mujoco
+        joint_vel_isaac = self.dof_vel * self._joint_sign_isaac_from_mujoco
         obs = np.concatenate(
             [
                 ang_vel,  # 3
                 self.quat_rotate_inverse(body_quat, np.array([0, 0, -1])),  # 3
                 self.command_vel,  # 3
-                (self.dof_pos - self.default_dof_pos),  # 21
-                self.dof_vel,  # 21
+                (joint_pos_isaac - self.default_dof_pos),  # 21
+                joint_vel_isaac,  # 21
                 np.clip(self.action, -self.cfg.sim.clip_actions, self.cfg.sim.clip_actions),  # 21
                 np.sin(2 * np.pi * self.gait_phase),  # 2
                 np.cos(2 * np.pi * self.gait_phase),  # 2
@@ -260,51 +361,80 @@ class MujocoRunner:
 
     def position_control(self) -> np.ndarray:
         """
-        Apply position control using scaled action.
+        PD 位置控制：tau = Kp*(q_des - q) - Kd*qd，与 Isaac Lab 训练时一致（roban_s14.py 的 stiffness/damping）。
+        目标位置由策略输出（Isaac 约定）转为 MuJoCo 约定：右腿/右臂取反。
 
         Returns:
-            np.ndarray: Target joint positions in MuJoCo actuator order.
+            np.ndarray: 关节力矩，MuJoCo 执行器顺序（23 维，手腕为 0）。
         """
         actions_scaled = self.action * self.cfg.sim.action_scale
-        processed_actions = actions_scaled + self.default_dof_pos
-        
-        # MuJoCo 执行器顺序：waist_yaw, leg_l1-6, leg_r1-6, zarm_l1-4, left_wrist, zarm_r1-4, right_wrist (23个)
-        # Isaac Lab 顺序：waist_yaw, leg_l1-6, leg_r1-6, zarm_l1-4, zarm_r1-4 (21个)
-        # 需要将 21 个关节映射到 23 个执行器（跳过手腕）
-        mujoco_ctrl = np.zeros(self.model.nu)  # 执行器数量
-        
-        # 映射 21 个关节到执行器
-        # 执行器索引：0-12 (waist + legs), 13-16 (zarm_l1-4), 17 (left_wrist跳过), 18-21 (zarm_r1-4), 22 (right_wrist跳过)
-        mujoco_ctrl[0] = processed_actions[0]   # waist_yaw
-        mujoco_ctrl[1:7] = processed_actions[1:7]   # leg_l1-6
-        mujoco_ctrl[7:13] = processed_actions[7:13]  # leg_r1-6
-        mujoco_ctrl[13:17] = processed_actions[13:17]  # zarm_l1-4
-        # mujoco_ctrl[17] = 0  # left_wrist (跳过)
-        mujoco_ctrl[18:22] = processed_actions[17:21]  # zarm_r1-4
-        # mujoco_ctrl[22] = 0  # right_wrist (跳过)
-        
+        q_des_isaac = actions_scaled + self.default_dof_pos  # 目标位置，Isaac 顺序 21
+        q_des_mujoco = q_des_isaac * self._joint_sign_isaac_from_mujoco  # 转为 MuJoCo 轴约定
+        q = self.dof_pos   # 当前位置，MuJoCo 传感器顺序
+        qd = self.dof_vel  # 当前速度，已重排为 Isaac 顺序，数值仍是 MuJoCo，与 q 同约定
+        tau = self.stiffness * (q_des_mujoco - q) - self.damping * qd  # 21 维，全 MuJoCo 约定
+
+        # 策略输出为 Isaac 顺序 21 维；此处按相同顺序算 tau，再按 MuJoCo 执行器顺序写入（与 XML actuator 一致）
+        mujoco_ctrl = np.zeros(self.model.nu)
+        mujoco_ctrl[0] = tau[0]
+        mujoco_ctrl[1:7] = tau[1:7]
+        mujoco_ctrl[7:13] = tau[7:13]
+        mujoco_ctrl[13:17] = tau[13:17]
+        # mujoco_ctrl[17] = 0  # left_wrist
+        mujoco_ctrl[18:22] = tau[17:21]
+        # mujoco_ctrl[22] = 0  # right_wrist
         return mujoco_ctrl
+
+    def print_joint_order(self) -> None:
+        """打印当前使用的 21 关节顺序（与 Isaac 策略观测/动作一致），便于与 Isaac 的 robot.data.joint_pos 顺序对照。"""
+        mujoco_joint_ids_isaac = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21, 22]
+        try:
+            # MuJoCo 3.x: mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, id)
+            obj_type = getattr(mujoco.mjtObj, "mjOBJ_JOINT", 2)
+        except AttributeError:
+            obj_type = 2
+        names_from_mujoco = []
+        for jid in mujoco_joint_ids_isaac:
+            n = mujoco.mj_id2name(self.model, obj_type, jid)
+            names_from_mujoco.append(n if n else f"(jid={jid})")
+        print("[sim2sim] 21 关节顺序（观测/策略动作/PD 目标均按此顺序，须与 Isaac robot.data.joint_pos 一致）：")
+        for i, (expected, actual) in enumerate(zip(ISAAC_JOINT_NAMES_21, names_from_mujoco)):
+            match = "  OK" if expected == actual else "  <-- 与预期不符"
+            print(f"  [{i:2d}] {actual}{match}")
+        print("[sim2sim] 若 Isaac 顺序不同，请在 Isaac 中打印 robot 的 joint 顺序并调整本脚本的映射。")
 
     def run(self) -> None:
         """
         Run the simulation loop with keyboard-controlled commands.
         """
+        self._reset_to_default_pose()
         self.setup_keyboard_listener()
         self.listener.start()
 
         while self.data.time < self.cfg.sim.sim_duration:
             self.obs_history = self.get_obs()
-            self.action[:] = self.policy(torch.tensor(self.obs_history, dtype=torch.float32)).detach().numpy()[:self.cfg.sim.num_action]
-            self.action = np.clip(self.action, -self.cfg.sim.clip_actions, self.cfg.sim.clip_actions)
+            if not self.zero_action and not self.hold_pose:
+                current_obs = self.obs_history[-self.cfg.sim.num_obs_per_step:]
+                obs_tensor = torch.tensor(current_obs, dtype=torch.float32).unsqueeze(0)
+                self.action[:] = self.policy(obs_tensor).detach().numpy()[0, : self.cfg.sim.num_action]
+                self.action = np.clip(self.action, -self.cfg.sim.clip_actions, self.cfg.sim.clip_actions)
+            else:
+                self.action[:] = 0.0  # 零动作或保持姿态时不用策略
 
             for sim_update in range(self.cfg.sim.decimation):
                 step_start_time = time.time()
-
-                mujoco_ctrl = self.position_control()
-                # 设置 MuJoCo 控制目标（位置控制）
-                self.data.ctrl[:] = mujoco_ctrl
-                
-                mujoco.mj_step(self.model, self.data)
+                if self.hold_pose:
+                    # 不仿真：每步强制 default 姿态、零力矩，仅做 mj_forward 看姿态是否正确
+                    self._reset_to_default_pose()
+                    self.data.ctrl[:] = 0.0
+                    mujoco.mj_forward(self.model, self.data)
+                else:
+                    self._read_dof_from_state()
+                    if self.zero_action:
+                        self._pin_base_to_default()  # 零策略时固定基座，只验证关节 PD，避免整机倾倒
+                    mujoco_ctrl = self.position_control()
+                    self.data.ctrl[:] = mujoco_ctrl
+                    mujoco.mj_step(self.model, self.data)
                 self.viewer.render()
 
                 elapsed = time.time() - step_start_time
@@ -402,6 +532,14 @@ if __name__ == "__main__":
         help="Path to model.xml",
     )
     parser.add_argument("--duration", type=float, default=100.0, help="Simulation duration in seconds")
+    parser.add_argument("--zero-action", action="store_true", help="不跑策略，动作恒为 0，仅用 PD 维持 default 姿态，用于调试")
+    parser.add_argument("--left-flip", action="store_true", help="对左腿/左臂关节做符号翻转")
+    parser.add_argument("--right-flip", action="store_true", help="对右腿/右臂关节做符号翻转")
+    parser.add_argument("--flip-knees", action="store_true", help="仅对膝盖(leg_l4/leg_r4)符号取反，膝反了时用")
+    parser.add_argument("--flip-arm-end", action="store_true", help="仅对小臂/手(zarm_l3/l4, zarm_r3/r4)符号取反")
+    parser.add_argument("--kp-scale", type=float, default=None, help="PD 刚度缩放，默认 0.5；可试 0.25 若仍蜷缩")
+    parser.add_argument("--hold-pose", action="store_true", help="每步强制 default 姿态、不积分，用于确认 default 在 MuJoCo 里是否站姿正确")
+    parser.add_argument("--print-joint-order", action="store_true", help="仅打印 21 关节顺序（与 Isaac 策略观测/动作一致），用于核对是否与 Isaac robot.data.joint_pos 一致，然后退出")
     args = parser.parse_args()
 
     if args.policy is None:
@@ -428,7 +566,7 @@ if __name__ == "__main__":
             # Fallback to Exported_policy directory
             args.policy = os.path.join(LEGGED_LAB_ROOT_DIR, "Exported_policy", f"{args.task}.pt")
 
-    if not os.path.isfile(args.policy):
+    if not args.print_joint_order and not args.zero_action and not args.hold_pose and not os.path.isfile(args.policy):
         print(f"[ERROR] Policy file not found: {args.policy}")
         print(f"[INFO] 请确保已通过 play.py 导出策略文件，或使用 --policy 指定正确的路径")
         print(f"[INFO] 导出的策略文件应该在: logs/{args.task}/*/exported/policy.pt")
@@ -443,6 +581,9 @@ if __name__ == "__main__":
 
     sim_cfg = SimToSimCfg()
     sim_cfg.sim.sim_duration = args.duration
+    if args.kp_scale is not None:
+        sim_cfg.robot.kp_scale_sim2sim = args.kp_scale
+        print(f"[INFO] PD 刚度缩放: {args.kp_scale}")
 
     # Set gait parameters according to task
     if args.task == "walk":
@@ -460,7 +601,29 @@ if __name__ == "__main__":
 
     runner = MujocoRunner(
         cfg=sim_cfg,
-        policy_path=args.policy,
+        policy_path=args.policy or "",
         model_path=args.model,
+        zero_action=args.zero_action or args.print_joint_order,
+        right_flip=args.right_flip,
+        left_flip=args.left_flip,
+        flip_knees=args.flip_knees,
+        flip_arm_end=args.flip_arm_end,
+        hold_pose=args.hold_pose,
+        skip_viewer=args.print_joint_order,
     )
+    if args.print_joint_order:
+        runner.print_joint_order()
+        sys.exit(0)
+    if args.zero_action:
+        print("[INFO] 零动作模式：仅 PD 维持 default 姿态，不调用策略；基座已固定，避免整机倾倒")
+    if args.hold_pose:
+        print("[INFO] 保持姿态模式：每步强制 default、不积分，用于检查 default 在 MuJoCo 中是否正确")
+    if args.left_flip:
+        print("[INFO] 已开启左腿/左臂符号翻转")
+    if args.right_flip:
+        print("[INFO] 已开启右腿/右臂符号翻转")
+    if args.flip_knees:
+        print("[INFO] 已开启膝盖(leg_l4/leg_r4)符号翻转")
+    if args.flip_arm_end:
+        print("[INFO] 已开启小臂/手(zarm_l3/l4, zarm_r3/r4)符号翻转")
     runner.run()

@@ -324,29 +324,18 @@ class AmpOnPolicyRunner:
                     terminal_amp_states = self.env.get_amp_obs_for_expert_trans()[reset_env_ids]
                     next_amp_obs_with_term[reset_env_ids] = terminal_amp_states
 
-                    # Compute rewards based on reward combination mode
-                    # Matching amp_roban_share: store task rewards and amp_states separately, combine during training
+                    # amp_share: rollout only stores task rewards and amp_obs; style reward in batch at compute_returns
                     if self.alg.use_amp_reward_combination:
-                        # New mode: separate task and AMP rewards (matching amp_roban_share)
-                        # Store task rewards as-is (no combination at env step)
                         task_rewards = rewards.clone()
-                        # Compute AMP style reward but don't combine yet
-                        amp_rewards, _ = self.alg.discriminator.predict_style_reward(
-                            amp_obs, next_amp_obs_with_term, 
-                            normalizer=self.alg.amp_normalizer,
-                            reward_scale=self.alg.discriminator_reward_scale
-                        )
-                        # For bootstrapping: use task rewards only (matching amp_roban_share behavior)
-                        # Bootstrapping will be applied to task rewards, then combination happens in compute_returns
                         rewards = task_rewards.clone()
+                        amp_rewards = None
                     else:
-                        # Old mode: lerp in discriminator (backward compatibility)
                         rewards = self.alg.discriminator.predict_amp_reward(
                             amp_obs, next_amp_obs_with_term, rewards, normalizer=self.alg.amp_normalizer
                         )[0]
                         task_rewards = None
                         amp_rewards = None
-                    
+
                     amp_obs = torch.clone(next_amp_obs)
                     self.alg.process_env_step(rewards, dones, infos, next_amp_obs_with_term, task_rewards, amp_rewards)
 
@@ -367,10 +356,11 @@ class AmpOnPolicyRunner:
                         else:
                             cur_reward_sum += rewards
                         
-                        # Update task and AMP rewards separately for monitoring
-                        if self.alg.use_amp_reward_combination and task_rewards is not None and amp_rewards is not None:
+                        # Update task (and AMP if per-step) rewards for monitoring
+                        if self.alg.use_amp_reward_combination and task_rewards is not None:
                             cur_task_reward_sum += task_rewards
-                            cur_amp_reward_sum += amp_rewards
+                            if amp_rewards is not None:
+                                cur_amp_reward_sum += amp_rewards
                         
                         # Update episode length
                         cur_episode_length += 1
@@ -380,10 +370,13 @@ class AmpOnPolicyRunner:
                         rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         
-                        # Store task and AMP rewards for completed episodes
-                        if self.alg.use_amp_reward_combination and task_rewards is not None and amp_rewards is not None:
+                        # Store task (and AMP if per-step) rewards for completed episodes
+                        if self.alg.use_amp_reward_combination and task_rewards is not None:
                             taskrewbuffer.extend(cur_task_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                            amprewbuffer.extend(cur_amp_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            if amp_rewards is not None:
+                                amprewbuffer.extend(cur_amp_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                            else:
+                                amprewbuffer.extend([0.0] * len(new_ids))
                             cur_task_reward_sum[new_ids] = 0
                             cur_amp_reward_sum[new_ids] = 0
                         cur_reward_sum[new_ids] = 0
@@ -409,7 +402,10 @@ class AmpOnPolicyRunner:
             # Add AMP reward combination metrics if enabled
             if self.alg.use_amp_reward_combination and len(taskrewbuffer) > 0:
                 mean_task_reward = statistics.mean(taskrewbuffer)
-                mean_amp_reward = statistics.mean(amprewbuffer)
+                # Use batch-computed style reward from compute_returns (amprewbuffer is 0 in this mode)
+                mean_amp_reward = getattr(
+                    self.alg, "_last_rollout_mean_style_reward", statistics.mean(amprewbuffer)
+                )
                 mean_total_reward = statistics.mean(rewbuffer)
                 # Calculate weighted rewards and combined total
                 weighted_task_reward = self.alg.task_reward_weight * mean_task_reward
@@ -510,54 +506,43 @@ class AmpOnPolicyRunner:
                     "Train/mean_episode_length/time", statistics.mean(locs["lenbuffer"]), self.tot_time
                 )
 
-        str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
-
+        # 精简终端日志：仅打印关键训练信息 + 课程进度
+        header = f"[Iter {locs['it']}/{locs['tot_iter']}]"
         if len(locs["rewbuffer"]) > 0:
+            mean_rew = statistics.mean(locs["rewbuffer"])
+            mean_len = statistics.mean(locs["lenbuffer"])
             log_string = (
-                f"""{'#' * width}\n"""
-                f"""{str.center(width, ' ')}\n\n"""
-                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
-                    'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
+                f"{header} fps={fps:.0f} "
+                f"mean_rew={mean_rew:.2f} ep_len={mean_len:.2f} "
+                f"collect={locs['collection_time']:.2f}s learn={locs['learn_time']:.2f}s "
+                f"std={mean_std.item():.2f}\n"
             )
-            # -- Losses
-            for key, value in locs["loss_dict"].items():
-                log_string += f"""{f'Mean {key} loss:':>{pad}} {value:.4f}\n"""
-            # -- Rewards
-            if self.alg.rnd:
-                log_string += (
-                    f"""{'Mean extrinsic reward:':>{pad}} {statistics.mean(locs['erewbuffer']):.2f}\n"""
-                    f"""{'Mean intrinsic reward:':>{pad}} {statistics.mean(locs['irewbuffer']):.2f}\n"""
-                )
-            log_string += f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
-            # -- AMP reward combination info
+            # AMP 奖励占比（如启用）
             if self.alg.use_amp_reward_combination and "amp_task_reward" in locs["loss_dict"]:
-                log_string += f"""{'Mean task reward:':>{pad}} {locs['loss_dict']['amp_task_reward']:.4f}\n"""
-                log_string += f"""{'Mean AMP reward:':>{pad}} {locs['loss_dict']['amp_style_reward']:.4f}\n"""
-                log_string += f"""{'AMP contribution:':>{pad}} {locs['loss_dict']['amp_contribution_ratio']*100:.2f}%\n"""
-            # -- episode info
-            log_string += f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
+                log_string += (
+                    f"  task_rew={locs['loss_dict']['amp_task_reward']:.4f} "
+                    f"style_rew={locs['loss_dict']['amp_style_reward']:.4f} "
+                    f"amp_ratio={locs['loss_dict']['amp_contribution_ratio']*100:.2f}%\n"
+                )
         else:
             log_string = (
-                f"""{'#' * width}\n"""
-                f"""{str.center(width, ' ')}\n\n"""
-                f"""{'Computation:':>{pad}} {fps:.0f} steps/s (collection: {locs[
-                    'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
-                f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
+                f"{header} fps={fps:.0f} "
+                f"collect={locs['collection_time']:.2f}s learn={locs['learn_time']:.2f}s "
+                f"std={mean_std.item():.2f}\n"
             )
-            for key, value in locs["loss_dict"].items():
-                log_string += f"""{f'{key}:':>{pad}} {value:.4f}\n"""
 
+        # 附加 episode / Curriculum 信息（来自 env.extras['log']）
         log_string += ep_string
-        log_string += (
-            f"""{'-' * width}\n"""
-            f"""{'Total timesteps:':>{pad}} {self.tot_timesteps}\n"""
-            f"""{'Iteration time:':>{pad}} {iteration_time:.2f}s\n"""
-            f"""{'Time elapsed:':>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
-            f"""{'ETA:':>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time / (locs['it'] - locs['start_iter'] + 1) * (
-                               locs['start_iter'] + locs['num_learning_iterations'] - locs['it'])))}\n"""
+        # 总进度与 ETA
+        eta = self.tot_time / (locs["it"] - locs["start_iter"] + 1) * (
+            locs["start_iter"] + locs["num_learning_iterations"] - locs["it"]
         )
-        print(log_string)
+        log_string += (
+            f"  total_steps={self.tot_timesteps} "
+            f"elapsed={time.strftime('%H:%M:%S', time.gmtime(self.tot_time))} "
+            f"ETA={time.strftime('%H:%M:%S', time.gmtime(eta))}\n"
+        )
+        print(log_string, end="")
 
     def save(self, path: str, infos=None):
         # -- Save model

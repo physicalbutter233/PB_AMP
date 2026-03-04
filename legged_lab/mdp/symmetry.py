@@ -188,19 +188,19 @@ def flip_action(actions: torch.Tensor, env: RobanEnv) -> torch.Tensor:
 
 
 def flip_amp_obs(amp_obs: torch.Tensor, env: RobanEnv) -> torch.Tensor:
-    """Flip 67-dim AMP observation.
+    """Flip 64-dim AMP observation (amp_share 同款：根旋转为 3D gravity).
 
     AMP obs layout (explicit order from get_amp_obs_for_expert_trans):
         [0:21]  joint_pos: [waist(1), left_leg(6), right_leg(6), left_arm(4), right_arm(4)]
         [21:42] joint_vel: same ordering
         [42:43] root_height: keep
-        [43:49] root_rotation (tangent+normal): flip y components
-        [49:52] root_lin_vel: [vx, -vy, vz]
-        [52:55] root_ang_vel: [-ωx, ωy, -ωz]
-        [55:58] left_hand_pos → right_hand_pos, y negate
-        [58:61] right_hand_pos → left_hand_pos, y negate
-        [61:64] left_foot_pos → right_foot_pos, y negate
-        [64:67] right_foot_pos → left_foot_pos, y negate
+        [43:46] root_gravity (3D): [gx, -gy, gz]
+        [46:49] root_lin_vel: [vx, -vy, vz]
+        [49:52] root_ang_vel: [-ωx, ωy, -ωz]
+        [52:55] left_hand_pos → right_hand_pos, y negate
+        [55:58] right_hand_pos → left_hand_pos, y negate
+        [58:61] left_foot_pos → right_foot_pos, y negate
+        [61:64] right_foot_pos → left_foot_pos, y negate
 
     NOTE: AMP obs uses explicit [waist, left_leg, right_leg, left_arm, right_arm] order,
     NOT the USD joint ordering. So we use hardcoded indices here.
@@ -227,43 +227,38 @@ def flip_amp_obs(amp_obs: torch.Tensor, env: RobanEnv) -> torch.Tensor:
     # --- root_height (42): keep ---
     flipped[:, 42] = amp_obs[:, 42]
 
-    # --- root_rotation tangent (43:46) and normal (46:49): y negate ---
-    # tangent: [tx, -ty, tz]
+    # --- root_gravity (43:46): [gx, -gy, gz] ---
     flipped[:, 43] = amp_obs[:, 43]
     flipped[:, 44] = -amp_obs[:, 44]
     flipped[:, 45] = amp_obs[:, 45]
-    # normal: [nx, -ny, nz]
+
+    # --- root_lin_vel (46:49): [vx, -vy, vz] ---
     flipped[:, 46] = amp_obs[:, 46]
     flipped[:, 47] = -amp_obs[:, 47]
     flipped[:, 48] = amp_obs[:, 48]
 
-    # --- root_lin_vel (49:52): [vx, -vy, vz] ---
-    flipped[:, 49] = amp_obs[:, 49]
-    flipped[:, 50] = -amp_obs[:, 50]
-    flipped[:, 51] = amp_obs[:, 51]
-
-    # --- root_ang_vel (52:55): [-ωx, ωy, -ωz] ---
-    flipped[:, 52] = -amp_obs[:, 52]
-    flipped[:, 53] = amp_obs[:, 53]
-    flipped[:, 54] = -amp_obs[:, 54]
+    # --- root_ang_vel (49:52): [-ωx, ωy, -ωz] ---
+    flipped[:, 49] = -amp_obs[:, 49]
+    flipped[:, 50] = amp_obs[:, 50]
+    flipped[:, 51] = -amp_obs[:, 51]
 
     # --- end_effector positions: swap L↔R, negate y ---
-    # left_hand (55:58) ← right_hand (58:61)
-    flipped[:, 55] = amp_obs[:, 58]       # x
-    flipped[:, 56] = -amp_obs[:, 59]      # -y
-    flipped[:, 57] = amp_obs[:, 60]       # z
-    # right_hand (58:61) ← left_hand (55:58)
-    flipped[:, 58] = amp_obs[:, 55]
-    flipped[:, 59] = -amp_obs[:, 56]
-    flipped[:, 60] = amp_obs[:, 57]
-    # left_foot (61:64) ← right_foot (64:67)
-    flipped[:, 61] = amp_obs[:, 64]
-    flipped[:, 62] = -amp_obs[:, 65]
-    flipped[:, 63] = amp_obs[:, 66]
-    # right_foot (64:67) ← left_foot (61:64)
-    flipped[:, 64] = amp_obs[:, 61]
-    flipped[:, 65] = -amp_obs[:, 62]
-    flipped[:, 66] = amp_obs[:, 63]
+    # left_hand (52:55) ← right_hand (55:58)
+    flipped[:, 52] = amp_obs[:, 55]
+    flipped[:, 53] = -amp_obs[:, 56]
+    flipped[:, 54] = amp_obs[:, 57]
+    # right_hand (55:58) ← left_hand (52:55)
+    flipped[:, 55] = amp_obs[:, 52]
+    flipped[:, 56] = -amp_obs[:, 53]
+    flipped[:, 57] = amp_obs[:, 54]
+    # left_foot (58:61) ← right_foot (61:64)
+    flipped[:, 58] = amp_obs[:, 61]
+    flipped[:, 59] = -amp_obs[:, 62]
+    flipped[:, 60] = amp_obs[:, 63]
+    # right_foot (61:64) ← left_foot (58:61)
+    flipped[:, 61] = amp_obs[:, 58]
+    flipped[:, 62] = -amp_obs[:, 59]
+    flipped[:, 63] = amp_obs[:, 60]
 
     return flipped
 

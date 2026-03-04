@@ -99,6 +99,8 @@ class RobanEnv(VecEnv):
 
         # ── 速度课程学习初始化（必须在 reset 之前，reset 会调用 _update_velocity_curriculum）──
         self._init_velocity_curriculum()
+        # ── 地形+推力课程（amp_share 同款，无速度课程时使用）──
+        self._init_terrain_force_curriculum()
 
         env_ids = torch.arange(self.num_envs, device=self.device)
         self.event_manager = EventManager(self.cfg.domain_rand.events, self)
@@ -241,6 +243,14 @@ class RobanEnv(VecEnv):
         self.avg_feet_speed_per_step = torch.zeros(
             self.num_envs, len(self.feet_cfg.body_ids), dtype=torch.float, device=self.device, requires_grad=False
         )
+        # 步态周期内双脚位移：用于奖励「两脚移动距离相近」
+        self._feet_pos_at_cycle_start = torch.zeros(
+            self.num_envs, 2, 3, dtype=torch.float, device=self.device, requires_grad=False
+        )
+        self._last_cycle_foot_distance = torch.zeros(
+            self.num_envs, 2, dtype=torch.float, device=self.device, requires_grad=False
+        )
+        self._prev_gait_phase = torch.zeros(self.num_envs, dtype=torch.float, device=self.device, requires_grad=False)
         self.init_obs_buffer()
 
     def visualize_motion(self, time):
@@ -348,7 +358,7 @@ class RobanEnv(VecEnv):
         self.right_arm_dof_pos = dof_pos[:, self.right_arm_ids]
         self.left_arm_dof_vel = dof_vel[:, self.left_arm_ids]
         self.right_arm_dof_vel = dof_vel[:, self.right_arm_ids]
-        # 输出与 get_amp_obs_for_expert_trans 一致的 67 维 AMP expert 格式
+        # 输出与 get_amp_obs_for_expert_trans 一致的 64 维 AMP expert 格式
         # 21 joint pos: waist, left_leg, right_leg, left_arm, right_arm
         # 21 joint vel: 同上
         # 1 root height + 6 root rotation + 3 root lin_vel + 3 root ang_vel
@@ -380,7 +390,7 @@ class RobanEnv(VecEnv):
             root_lin_vel_b = quat_apply(quat_conjugate(root_quat), root_lin_vel_w)
             root_ang_vel_b = quat_apply(quat_conjugate(root_quat), root_ang_vel_w)
             
-            # Return 67-dim AMP observation (same format as get_amp_obs_for_expert_trans)
+            # Return 64-dim AMP observation (same format as get_amp_obs_for_expert_trans)
             return torch.cat(
                 (
                     joint_pos_21,
@@ -482,10 +492,14 @@ class RobanEnv(VecEnv):
         self.extras["log"] = dict()
         if vel_cur_extras:
             self.extras["log"].update(vel_cur_extras)
-        if self.cfg.scene.terrain_generator is not None:
-            if self.cfg.scene.terrain_generator.curriculum:
-                terrain_levels = self.update_terrain_levels(env_ids)
-                self.extras["log"].update(terrain_levels)
+
+        # ── 地形+推力课程（amp_share 同款，须在 reward_manager.reset 前读 _episode_sums）──
+        tf_cur_extras = self._update_terrain_force_curriculum(env_ids)
+        if tf_cur_extras:
+            self.extras["log"].update(tf_cur_extras)
+        elif self.cfg.scene.terrain_generator is not None and self.cfg.scene.terrain_generator.curriculum:
+            terrain_levels = self.update_terrain_levels(env_ids)
+            self.extras["log"].update(terrain_levels)
 
         self.scene.reset(env_ids)
         if "reset" in self.event_manager.available_modes:
@@ -508,6 +522,12 @@ class RobanEnv(VecEnv):
 
         self.scene.write_data_to_sim()
         self.sim.forward()
+
+        # 步态周期双脚位移：重置后以当前脚位置作为新周期起点
+        feet_pos = self.robot.data.body_pos_w[env_ids][:, self.feet_body_ids, :]
+        self._feet_pos_at_cycle_start[env_ids, :, :] = feet_pos
+        self._last_cycle_foot_distance[env_ids, :] = 0.0
+        self._prev_gait_phase[env_ids] = 0.0
 
     def step(self, actions: torch.Tensor):
         delayed_actions = self.action_buffer.compute(actions)
@@ -540,7 +560,25 @@ class RobanEnv(VecEnv):
             self.sim.render()
 
         self.episode_length_buf += 1
+        prev_phase = self.gait_phase[:, 0].clone()
         self._calculate_gait_para()
+        # 步态周期回绕检测：相位从 ~1 回到 ~0 时完成一个周期，更新周期内双脚位移
+        feet_pos = self.robot.data.body_pos_w[:, self.feet_body_ids, :]
+        first_step = self.episode_length_buf == 1
+        if first_step.any():
+            self._feet_pos_at_cycle_start[first_step] = feet_pos[first_step]
+        wrap = prev_phase > self.gait_phase[:, 0] + 0.01
+        if wrap.any():
+            dist_left = torch.norm(
+                feet_pos[wrap, 0, :] - self._feet_pos_at_cycle_start[wrap, 0, :], dim=1
+            )
+            dist_right = torch.norm(
+                feet_pos[wrap, 1, :] - self._feet_pos_at_cycle_start[wrap, 1, :], dim=1
+            )
+            self._last_cycle_foot_distance[wrap, 0] = dist_left
+            self._last_cycle_foot_distance[wrap, 1] = dist_right
+            self._feet_pos_at_cycle_start[wrap, :, :] = feet_pos[wrap, :, :]
+        self._prev_gait_phase = self.gait_phase[:, 0].clone()
 
         self.command_generator.compute(self.step_dt)
         if "interval" in self.event_manager.available_modes:
@@ -697,6 +735,93 @@ class RobanEnv(VecEnv):
         print(f"  Deadband: lin_vel={cur_cfg.lin_vel_deadband}m/s, ang_vel={cur_cfg.ang_vel_deadband}rad/s")
         if getattr(cur_cfg, "reward_multipliers", None):
             print(f"  [DynamicRewardScaling] Level 0 multipliers: {cur_cfg.reward_multipliers[0]}")
+
+    def _init_terrain_force_curriculum(self):
+        """地形+推力课程（amp_share 同款）：初始化外力水平与 stage two 标志。"""
+        cur_cfg = getattr(self.cfg, "terrain_force_curriculum", None)
+        self._tf_curriculum_enabled = cur_cfg is not None and getattr(cur_cfg, "enable", False)
+        if not self._tf_curriculum_enabled:
+            return
+        self._tf_cur_cfg = cur_cfg
+        low = getattr(cur_cfg, "force_level_low", 0.2)
+        self._external_force_torque_level = torch.ones(
+            self.num_envs, 1, 1, device=self.device, dtype=torch.float
+        ) * low
+        self._stage_two_done = False
+        print(
+            f"[TerrainForceCurriculum] amp_share 同款: 地形+推力课程, stage_two 阈值 mean(force_level)>={cur_cfg.stage_two_force_threshold}"
+        )
+
+    def _update_terrain_force_curriculum(self, env_ids) -> dict:
+        """地形课程 + 推力课程（amp_share 公式）；外力水平>=阈值时一次性应用 stage_two 权重。"""
+        if not self._tf_curriculum_enabled:
+            return {}
+        reward = self.reward_manager
+        # 在 reward_manager.reset 前读取 episode 累积（amp_share 同款）
+        lin_sum = reward._episode_sums["track_lin_vel_xy_exp"][env_ids] / self.max_episode_length_s
+        ang_sum = reward._episode_sums["track_ang_vel_z_exp"][env_ids] / self.max_episode_length_s
+        lin_idx = reward._term_names.index("track_lin_vel_xy_exp")
+        ang_idx = reward._term_names.index("track_ang_vel_z_exp")
+        lin_w = reward._term_cfgs[lin_idx].weight
+        ang_w = reward._term_cfgs[ang_idx].weight
+        distance = torch.norm(
+            self.robot.data.root_pos_w[env_ids, :2] - self.scene.env_origins[env_ids, :2], dim=1
+        )
+        tg = getattr(self.scene.terrain.cfg, "terrain_generator", None) if self.scene.terrain.cfg else None
+        terrain_size = tg.size[0] if (tg is not None and getattr(tg, "size", None) is not None) else float("inf")
+        # 地形：amp_share terrain_levels_vel
+        move_up_terrain = (
+            (distance > terrain_size / 3)
+            & (lin_sum > lin_w * 0.7)
+            & (ang_sum > ang_w * 0.7)
+        )
+        move_down_terrain = (lin_sum < lin_w * 0.6) | (ang_sum < ang_w * 0.6)
+        move_down_terrain = move_down_terrain & ~move_up_terrain
+        if self.cfg.scene.terrain_generator is not None and self.cfg.scene.terrain_generator.curriculum:
+            self.scene.terrain.update_env_origins(env_ids, move_up_terrain, move_down_terrain)
+        # 推力：amp_share external_force_torque_levels
+        move_up_force = (lin_sum > lin_w * 0.6) & (ang_sum > ang_w * 0.7)
+        move_down_force = (lin_sum < lin_w * 0.5) | (ang_sum < ang_w * 0.6)
+        move_down_force = move_down_force & ~move_up_force
+        step = getattr(self._tf_cur_cfg, "force_level_step", 0.05)
+        low = getattr(self._tf_cur_cfg, "force_level_low", 0.2)
+        self._external_force_torque_level[env_ids[move_up_force]] += step
+        self._external_force_torque_level[env_ids[move_down_force]] -= step
+        self._external_force_torque_level.clamp_(min=low, max=1.0)
+        mean_force = self._external_force_torque_level.float().mean().item()
+        # stage two：mean(force_level) >= 0.9 时一次性重写权重（amp_share 同款）
+        if (
+            not self._stage_two_done
+            and mean_force >= getattr(self._tf_cur_cfg, "stage_two_force_threshold", 0.9)
+        ):
+            self._stage_two_done = True
+            weights = getattr(self._tf_cur_cfg, "stage_2_reward_weights", None) or {}
+            for name, w in weights.items():
+                if name in reward._term_names:
+                    idx = reward._term_names.index(name)
+                    reward._term_cfgs[idx].weight = float(w)
+            self._external_force_torque_level[:] = low
+            print("[TerrainForceCurriculum] Stage two 已触发，奖励权重已重写，外力水平已重置。")
+        # 调试：每次 reset 时满足升级/降级的 env 数量，便于确认「不动」是条件未满足还是逻辑未执行
+        n_reset = len(env_ids)
+        extras = {
+            "Curriculum/terrain_levels": torch.mean(self.scene.terrain.terrain_levels.float()).item()
+            if self.cfg.scene.terrain_generator is not None
+            else 0.0,
+            "Curriculum/external_force_level": mean_force,
+            "Curriculum/num_reset_this_step": n_reset,
+            "Curriculum/num_move_up_terrain": move_up_terrain.sum().item(),
+            "Curriculum/num_move_down_terrain": move_down_terrain.sum().item(),
+            "Curriculum/num_move_up_force": move_up_force.sum().item(),
+            "Curriculum/num_move_down_force": move_down_force.sum().item(),
+        }
+        if n_reset > 0:
+            extras["Curriculum/mean_lin_sum"] = lin_sum.float().mean().item()
+            extras["Curriculum/mean_ang_sum"] = ang_sum.float().mean().item()
+            # 升级阈值参考（便于对照：lin_sum 需 > lin_w*0.7 地形才升，> lin_w*0.6 推力才升）
+            extras["Curriculum/thresh_lin_up"] = (lin_w * 0.7)
+            extras["Curriculum/thresh_ang_up"] = (ang_w * 0.7)
+        return extras
 
     def _apply_velocity_level(self, level: int):
         """将指定级别的速度范围写入 command_generator，并更新奖励权重缩放。"""
@@ -887,8 +1012,11 @@ class RobanEnv(VecEnv):
         return extras
 
     def update_terrain_levels(self, env_ids):
+        tg = getattr(self.scene.terrain.cfg, "terrain_generator", None) if getattr(self.scene, "terrain", None) and getattr(self.scene.terrain, "cfg", None) else None
+        if tg is None or getattr(tg, "size", None) is None:
+            return {}
         distance = torch.norm(self.robot.data.root_pos_w[env_ids, :2] - self.scene.env_origins[env_ids, :2], dim=1)
-        move_up = distance > self.scene.terrain.cfg.terrain_generator.size[0] / 2
+        move_up = distance > tg.size[0] / 2
         move_down = (
             distance < torch.norm(self.command_generator.command[env_ids, :2], dim=1) * self.max_episode_length_s * 0.5
         )
@@ -904,11 +1032,12 @@ class RobanEnv(VecEnv):
         return actor_obs, self.extras
 
     def get_amp_obs_for_expert_trans(self):
-        """AMP obs for 21-DoF Roban with root state: 
-        joint_pos(21) + joint_vel(21) + root_height(1) + 
-        root_rotation(6) + root_lin_vel(3) + root_ang_vel(3) + 
-        end_effector_pos(12) = 67.
-        Order: waist, left_leg, right_leg, left_arm, right_arm (pos then vel), 
+        """AMP obs for 21-DoF Roban with root state (amp_share 同款 64 维):
+        joint_pos(21) + joint_vel(21) + root_height(1) +
+        root_gravity(3) + root_lin_vel(3) + root_ang_vel(3) +
+        end_effector_pos(12) = 64.
+        root_gravity: 世界重力 [0,0,-1] 在 body 系下的表示（3D，与 amp_share 一致）。
+        Order: waist, left_leg, right_leg, left_arm, right_arm (pos then vel),
         then root state, then hand/foot positions.
         """
         left_hand_pos = (
@@ -951,27 +1080,26 @@ class RobanEnv(VecEnv):
             dim=-1,
         )
         
-        # Root state information
+        # Root state information (amp_share 同款：根旋转仅用 3D 重力向量)
         root_quat = self.robot.data.root_state_w[:, 3:7]  # Quaternion (w, x, y, z)
         root_height = self.robot.data.root_state_w[:, 2:3]  # Root height (z coordinate)
-        
-        # Convert quaternion to tangent and normal vectors (6D)
-        root_rotation = self._quaternion_to_tangent_and_normal(root_quat)
-        
+        # 世界重力 [0,0,-1] 在 body 系下的表示（3D）
+        gravity_world = torch.zeros(self.num_envs, 3, device=self.device, dtype=root_quat.dtype)
+        gravity_world[:, 2] = -1.0
+        root_gravity = quat_apply(quat_conjugate(root_quat), gravity_world)
+
         # Root linear and angular velocities (in root frame)
         root_lin_vel_w = self.robot.data.root_state_w[:, 7:10]  # World frame
         root_ang_vel_w = self.robot.data.root_state_w[:, 10:13]  # World frame
-        
-        # Transform velocities to root frame
         root_lin_vel_b = quat_apply(quat_conjugate(root_quat), root_lin_vel_w)
         root_ang_vel_b = quat_apply(quat_conjugate(root_quat), root_ang_vel_w)
-        
+
         return torch.cat(
             (
                 joint_pos_21,
                 joint_vel_21,
                 root_height,
-                root_rotation,
+                root_gravity,
                 root_lin_vel_b,
                 root_ang_vel_b,
                 left_hand_pos,

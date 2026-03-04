@@ -12,6 +12,7 @@
 # and is distributed under the BSD-3-Clause license.
 
 import math
+import os
 
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
@@ -45,6 +46,44 @@ from legged_lab.envs.base.base_config import (
 )
 from legged_lab.terrains import GRAVEL_TERRAINS_CFG, ROUGH_TERRAINS_CFG  # noqa:F401
 
+# 与 amp_roban_share 一致的多轨迹 AMP 路径与权重（RobanS2MixEnvCfg.motion_mode["slowly_move_flip"]）
+# 需保证 AMP 工作区下存在 amp_roban_share 及对应 npz 轨迹文件
+def _get_amp_share_motions_dir():
+    """AMP 仓库根目录下的 amp_roban_share motions 目录。"""
+    _dir = os.path.dirname(os.path.abspath(__file__))
+    # roban -> envs -> legged_lab -> PB_AMP -> AMP
+    amp_root = os.path.abspath(os.path.join(_dir, "..", "..", "..", "..", ".."))
+    return os.path.join(amp_root, "amp_roban_share", "source", "ext_roban", "ext_roban", "utils", "motions")
+
+
+def get_amp_motion_files_multi_trajectory():
+    """与 amp_share 完全一致的多轨迹与权重（dict {path: weight}），用于多轨迹 AMP 跟踪。
+    若 amp_roban_share 的 motions 目录不存在，则回退为单轨迹 .txt。
+    """
+    MOTIONS_DIR = _get_amp_share_motions_dir()
+    scaled_dir = os.path.join(MOTIONS_DIR, "scaled_shoulder_only")
+    if not os.path.isdir(scaled_dir):
+        return ["legged_lab/envs/roban/datasets/motion_amp_expert/walk_pb_add_root.txt"]
+    return {
+        os.path.join(MOTIONS_DIR, "scaled_shoulder_only", "直行_中速_小摆手_003_Skeleton.npz"): 1.5,
+        os.path.join(MOTIONS_DIR, "scaled_shoulder_only", "直行_中速_小摆手_005_Skeleton.npz"): 1.5,
+        os.path.join(MOTIONS_DIR, "scaled_shoulder_only", "直行_中速_小摆手_006_Skeleton.npz"): 1.5,
+        os.path.join(MOTIONS_DIR, "scaled_shoulder_only", "直行_低速_小摆手_Skeleton.npz"): 2.0,
+        os.path.join(MOTIONS_DIR, "scaled_shoulder_only", "后退_中速_小摆手_000_Skeleton.npz"): 2.0,
+        os.path.join(MOTIONS_DIR, "scaled_shoulder_only", "后退_低速_小摆手_000_Skeleton.npz"): 2.0,
+        os.path.join(MOTIONS_DIR, "scaled_shoulder_only", "后退_低速_小摆手_Skeleton.npz"): 2.0,
+        os.path.join(MOTIONS_DIR, "scaled_shoulder_only", "弧线_小右_Skeleton.npz"): 1.0,
+        os.path.join(MOTIONS_DIR, "scaled_shoulder_only", "弧线_中左_Skeleton.npz"): 1.0,
+        os.path.join(MOTIONS_DIR, "scaled_shoulder_only", "弧线_中右_Skeleton.npz"): 1.0,
+        os.path.join(MOTIONS_DIR, "scaled_shoulder_only", "椭圆_Skeleton.npz"): 1.0,
+        os.path.join(MOTIONS_DIR, "scaled_shoulder_only", "圆_Skeleton.npz"): 1.0,
+        os.path.join(MOTIONS_DIR, "scaled_shoulder_only", "原地转圈_低速_逆时针_Skeleton.npz"): 1.5,
+        os.path.join(MOTIONS_DIR, "scaled_shoulder_only", "原地转圈_低速_顺时针_Skeleton.npz"): 1.5,
+        os.path.join(MOTIONS_DIR, "scaled_shoulder_only", "原地转圈_加减速_逆时针_Skeleton.npz"): 1.5,
+        os.path.join(MOTIONS_DIR, "scaled_shoulder_only", "原地转圈_加减速_顺时针_Skeleton.npz"): 1.5,
+        os.path.join(MOTIONS_DIR, "BVH_retargeted_motion", "静止站立_LiuKe_Skeleton.npz"): 1.5,
+    }
+
 
 @configclass
 class GaitCfg:
@@ -53,6 +92,30 @@ class GaitCfg:
     gait_phase_offset_l: float = 0.0
     gait_phase_offset_r: float = 0.5
     gait_cycle: float = 1.0
+
+
+@configclass
+class TerrainForceCurriculumCfg:
+    """与 amp_share 一致：地形课程 + 推力课程，切换条件为外力水平 >= stage_two_force_threshold 时应用 stage_2 权重。"""
+    enable: bool = True
+    # 推力课程：每 env 的 level，[low_level, 1]，步长 0.05
+    force_level_low: float = 0.2
+    force_level_step: float = 0.05
+    # 当 mean(外力水平) >= 此值时触发 stage two（一次性重写奖励权重）
+    stage_two_force_threshold: float = 0.9
+    # stage two 时各 reward term 的目标权重（仅覆盖存在的项，与 amp_share stage_2_reward_weight 对应）
+    stage_2_reward_weights: dict = None
+
+    def __post_init__(self):
+        if self.stage_2_reward_weights is None:
+            self.stage_2_reward_weights = {
+                "track_lin_vel_xy_exp": 4.5,
+                "track_ang_vel_z_exp": 2.25,
+                "action_rate_l2": -0.01,
+                "dof_acc_l2": -1e-5,
+                "feet_contact_time_symmetry": 1.0,
+                "feet_distance_symmetry_per_cycle": 1.0,
+            }
 
 
 @configclass
@@ -135,6 +198,7 @@ class VelocityCurriculumCfg:
                     "humanoid_single_support_reward": 1.0,
                     "humanoid_swing_foot_height": 1.0,
                     "feet_contact_time_symmetry": 1.0,
+                    "feet_distance_symmetry_per_cycle": 1.0,
                     "feet_distance": 1.0,
                 },
                 # Level 1 (Steering): 聚焦转向精度
@@ -146,9 +210,18 @@ class VelocityCurriculumCfg:
                     "humanoid_single_support_reward": 1.0,
                     "humanoid_swing_foot_height": 1.0,
                     "feet_contact_time_symmetry": 1.0,
+                    "feet_distance_symmetry_per_cycle": 1.0,
                 },
-                # Level 2 (Omni & Refinement): 原始权重
-                {},
+                # Level 2 (Omni & Refinement): 对齐 amp_share stage_two 权重逻辑
+                # 进入全指令范围后加强跟踪与平滑/对称，对应 stage_2_reward_weight
+                {
+                    "track_lin_vel_xy_exp": 2.25,   # amp_share stage_two: 4.5 (≈ base 2.0 * 2.25)
+                    "track_ang_vel_z_exp": 1.5,     # amp_share: 2.25 (≈ base 1.5 * 1.5)
+                    "action_rate_l2": 2.0,          # 加强动作平滑惩罚 (amp: -0.01)
+                    "dof_acc_l2": 4.0,              # 加强关节加速度惩罚 (amp: -1e-5)
+                    "feet_contact_time_symmetry": 1.2,
+                    "feet_distance_symmetry_per_cycle": 1.2,
+                },
             ]
 
 
@@ -287,7 +360,7 @@ class RobanLiteRewardCfg(LiteRewardCfg):
     )
     humanoid_swing_foot_height = RewTerm(
         func=mdp.humanoid_swing_foot_height_reward,
-        weight=1.0,  # moderate, does not dominate velocity tracking
+        weight=3.5,  # moderate, does not dominate velocity tracking
         params={
             "threshold": 10.0,
             "height_threshold": 0.05,
@@ -298,8 +371,19 @@ class RobanLiteRewardCfg(LiteRewardCfg):
     )
     humanoid_swing_foot_forward = RewTerm(
         func=mdp.humanoid_swing_foot_forward_reward,
-        weight=5.0,  # small: anti-moonwalk
+        weight=5.0,  # 单支撑时奖励摆动脚向前（左脚支撑奖右脚向前，反之亦然）
         params={
+            "threshold": 10.0,
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
+            "asset_cfg": SceneEntityCfg("robot", body_names=["leg_l6_link", "leg_r6_link"]),
+        },
+    )
+    # 单支撑时严重惩罚摆动脚横向偏离重心（不超过肩宽一半），防圆规步态
+    humanoid_swing_foot_lateral_penalty = RewTerm(
+        func=mdp.humanoid_swing_foot_lateral_penalty,
+        weight=-5.0,
+        params={
+            "max_lateral_offset": 0.15,
             "threshold": 10.0,
             "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
             "asset_cfg": SceneEntityCfg("robot", body_names=["leg_l6_link", "leg_r6_link"]),
@@ -319,6 +403,12 @@ class RobanLiteRewardCfg(LiteRewardCfg):
             "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
         },
     )
+    # 一个步态周期内两脚移动距离相近
+    feet_distance_symmetry_per_cycle = RewTerm(
+        func=mdp.feet_distance_symmetry_per_cycle_exp,
+        weight=1.0,
+        params={"sigma": 0.1, "min_stride": 0.05},
+    )
 
     # ─── REMOVED/DISABLED ───
     # feet_air_time (replaced by contact-phase rewards: single support + swing height)
@@ -328,6 +418,7 @@ class RobanLiteRewardCfg(LiteRewardCfg):
 
 @configclass
 class RobanWalkFlatEnvCfg:
+    """与 amp_share (RobanS2MixEnvCfg) 一致：地形课程 + 推力课程，无速度课程；外力>=0.9 时 stage two 权重重写。"""
     amp_motion_files_display = ["legged_lab/envs/roban/datasets/motion_visualization/walk_pb_easy_nowrist.txt"]
     amp_num_joints = 21  # Roban no-wrist: waist(1)+legs(12)+arms(8)=21
     device: str = "cuda:0"
@@ -337,8 +428,8 @@ class RobanWalkFlatEnvCfg:
         env_spacing=2.5,
         robot=ROBAN_S14_CFG,
         terrain_type="generator",
-        terrain_generator=GRAVEL_TERRAINS_CFG,
-        max_init_terrain_level=5,
+        terrain_generator=ROUGH_TERRAINS_CFG,
+        max_init_terrain_level=0,
         height_scanner=HeightScannerCfg(
             enable_height_scan=False,
             prim_body_name="base_link",
@@ -376,24 +467,30 @@ class RobanWalkFlatEnvCfg:
         height_scan_offset=0.5,
     )
     commands: CommandsCfg = CommandsCfg(
-        resampling_time_range=(10.0, 10.0),
-        rel_standing_envs=0.2,
-        rel_heading_envs=1.0,
+        resampling_time_range=(0.5, 5.0),
+        rel_standing_envs=0.5,
+        rel_heading_envs=0.8,
         heading_command=True,
-        heading_control_stiffness=0.5,
+        heading_control_stiffness=0.3,
         debug_vis=True,
         ranges=CommandRangesCfg(
-            lin_vel_x=(-0.6, 1.0), lin_vel_y=(-0.5, 0.5), ang_vel_z=(-1.57, 1.57), heading=(-math.pi, math.pi)
+            lin_vel_x=(-0.6, 0.6),
+            lin_vel_y=(-0.6, 0.6),
+            ang_vel_z=(-1.0, 1.0),
+            heading=(-math.pi, math.pi),
         ),
     )
-    velocity_curriculum: VelocityCurriculumCfg = VelocityCurriculumCfg()
+    # 与 amp_share 对齐：本任务不启用速度课程（仅使用地形+推力课程）
+    velocity_curriculum: VelocityCurriculumCfg | None = None
+    terrain_force_curriculum: TerrainForceCurriculumCfg = TerrainForceCurriculumCfg()
     noise: NoiseCfg = NoiseCfg(
         add_noise=True,
         noise_scales=NoiseScalesCfg(
             lin_vel=0.2,
             ang_vel=0.2,
             projected_gravity=0.05,
-            joint_pos=0.01,
+            # 与 amp_share Policy 观测噪声量级对齐（joint_pos ≈ ±0.05）
+            joint_pos=0.05,
             joint_vel=1.5,
             height_scan=0.1,
         ),
@@ -405,33 +502,72 @@ class RobanWalkFlatEnvCfg:
                 mode="startup",
                 params={
                     "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-                    "static_friction_range": (0.6, 1.0),
-                    "dynamic_friction_range": (0.4, 0.8),
-                    "restitution_range": (0.0, 0.005),
+                    # 对齐 amp_share：更宽的摩擦 / 恢复系数范围
+                    "static_friction_range": (0.3, 1.0),
+                    "dynamic_friction_range": (0.2, 1.0),
+                    "restitution_range": (0.0, 0.5),
                     "num_buckets": 64,
                 },
             ),
-            add_base_mass=EventTerm(
+            # 对齐 amp_share：腿/臂 link 质量缩放，而不是只给 base_link 加质量
+            scale_link_mass=EventTerm(
                 func=mdp.randomize_rigid_body_mass,
                 mode="startup",
                 params={
+                    "asset_cfg": SceneEntityCfg(
+                        "robot", body_names=["leg_.*_link", "zarm_.*_link"]
+                    ),
+                    "mass_distribution_params": (0.8, 1.2),
+                    "operation": "scale",
+                },
+            ),
+            randomize_rigid_body_com=EventTerm(
+                func=mdp.randomize_base_body_com,
+                mode="startup",
+                params={
                     "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
-                    "mass_distribution_params": (-5.0, 5.0),
-                    "operation": "add",
+                    "com_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.05, 0.05)},
+                },
+            ),
+            scale_actuator_gains=EventTerm(
+                func=mdp.randomize_actuator_gains,
+                mode="startup",
+                params={
+                    "asset_cfg": SceneEntityCfg("robot", joint_names=".*_joint"),
+                    "stiffness_distribution_params": (0.8, 1.2),
+                    "damping_distribution_params": (0.8, 1.2),
+                    "operation": "scale",
+                },
+            ),
+            scale_joint_parameters=EventTerm(
+                func=mdp.randomize_joint_parameters,
+                mode="startup",
+                params={
+                    "asset_cfg": SceneEntityCfg("robot", joint_names=".*_joint"),
+                    "friction_distribution_params": (1.0, 1.0),
+                    "armature_distribution_params": (0.5, 1.5),
+                    "operation": "scale",
                 },
             ),
             reset_base=EventTerm(
                 func=mdp.reset_root_state_uniform,
                 mode="reset",
                 params={
-                    "pose_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "yaw": (-3.14, 3.14)},
+                    # 对齐 amp_share：位置范围略大，增加 pitch/roll 随机
+                    "pose_range": {
+                        "x": (-0.7, 0.7),
+                        "y": (-0.7, 0.7),
+                        "yaw": (-3.14, 3.14),
+                        "pitch": (-0.1, 0.1),
+                        "roll": (-0.1, 0.1),
+                    },
                     "velocity_range": {
-                        "x": (-0.5, 0.5),
-                        "y": (-0.5, 0.5),
-                        "z": (-0.5, 0.5),
-                        "roll": (-0.5, 0.5),
-                        "pitch": (-0.5, 0.5),
-                        "yaw": (-0.5, 0.5),
+                        "x": (-0.3, 0.3),
+                        "y": (-0.3, 0.3),
+                        "z": (-0.3, 0.3),
+                        "roll": (-0.3, 0.3),
+                        "pitch": (-0.3, 0.3),
+                        "yaw": (-0.3, 0.3),
                     },
                 },
             ),
@@ -443,10 +579,11 @@ class RobanWalkFlatEnvCfg:
                     "velocity_range": (0.0, 0.0),
                 },
             ),
+            # Interval 推力：使用与 base_config 相同的速度脉冲形式，但频率对齐 amp_share
             push_robot=EventTerm(
                 func=mdp.push_by_setting_velocity,
                 mode="interval",
-                interval_range_s=(10.0, 15.0),
+                interval_range_s=(0.01, 0.3),
                 params={"velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)}},
             ),
         ),
@@ -478,7 +615,7 @@ class RobanWalkAgentCfg(RslRlOnPolicyRunnerCfg):
         entropy_coef=0.005,
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=1.0e-3,
+        learning_rate=1.0e-4,
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,
@@ -489,7 +626,7 @@ class RobanWalkAgentCfg(RslRlOnPolicyRunnerCfg):
             use_data_augmentation=True,
             use_mirror_loss=True,
             data_augmentation_func="legged_lab.mdp.symmetry:roban_symmetry_augmentation",
-            mirror_loss_coeff=1.5,
+            mirror_loss_coeff=3.0,
         ),
         rnd_cfg=None,  # RslRlRndCfg()
     )
@@ -506,12 +643,13 @@ class RobanWalkAgentCfg(RslRlOnPolicyRunnerCfg):
     load_checkpoint = "model_.*.pt"
 
     # amp parameter
-    # 使用与 amp_roban_share 一致的奖励计算机制
-    # 奖励组合方式：combined_reward = task_reward_weight * task_reward + style_reward_weight * style_reward
-    amp_motion_files = ["legged_lab/envs/roban/datasets/motion_amp_expert/walk_pb_add_root.txt"]
+    # 多轨迹 AMP 跟踪：与 amp_share 完全相同的动作轨迹与权重（dict {path: weight}）
+    # 使用 amp_roban_share 的 npz 轨迹与权重；若未放置 npz，可改为单轨迹：
+    # amp_motion_files = ["legged_lab/envs/roban/datasets/motion_amp_expert/walk_pb_add_root.txt"]
+    amp_motion_files = get_amp_motion_files_multi_trajectory()
     amp_num_preload_transitions = 200000
     amp_discr_hidden_dims = [1024, 512, 256]
-    min_normalized_std = [0.05] * 67  # AMP obs dim: 21 joint_pos + 21 joint_vel + 1 root_height + 6 root_rotation + 3 root_lin_vel + 3 root_ang_vel + 12 end_effector
+    min_normalized_std = [0.05] * 64  # AMP obs dim (amp_share 同款): 21 joint_pos + 21 joint_vel + 1 root_height + 3 root_gravity + 3 root_lin_vel + 3 root_ang_vel + 12 end_effector
     
     # 向后兼容参数（如果使用旧机制）
     amp_reward_coef = 0.3  # 仅用于向后兼容，新机制不使用
@@ -526,8 +664,8 @@ class RobanWalkAgentCfg(RslRlOnPolicyRunnerCfg):
 
     # ===== 对称性额外参数 (传递给 AMPPPO via runner) =====
     # Critic 对称性损失系数：V(obs) ≈ V(mirror(obs))
-    critic_mirror_loss_coeff: float = 1.5
+    critic_mirror_loss_coeff: float = 3
     # Discriminator 对称性损失模式：0=关闭, 1=仅 policy, 2=仅 expert, 3=两者都用
     disc_sym_loss_mode: int = 3
     # Discriminator 对称性损失系数
-    disc_mirror_loss_coeff: float = 1.5
+    disc_mirror_loss_coeff: float = 3

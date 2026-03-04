@@ -32,7 +32,8 @@ class RolloutStorage:
             self.privileged_actions = None
             self.rewards = None
             self.task_rewards = None  # Task rewards (for AMP reward combination)
-            self.amp_rewards = None   # AMP style rewards (for AMP reward combination)
+            self.amp_rewards = None   # AMP style rewards (for AMP reward combination, legacy per-step)
+            self.amp_states = None   # AMP obs (next state) per step, for batch style reward in compute_returns (amp_share)
             self.dones = None
             self.values = None
             self.actions_log_prob = None
@@ -54,6 +55,7 @@ class RolloutStorage:
         actions_shape,
         rnd_state_shape=None,
         device="cpu",
+        amp_obs_shape=None,
     ):
         # store inputs
         self.training_type = training_type
@@ -64,6 +66,7 @@ class RolloutStorage:
         self.privileged_obs_shape = privileged_obs_shape
         self.rnd_state_shape = rnd_state_shape
         self.actions_shape = actions_shape
+        self.amp_obs_shape = amp_obs_shape  # [D] for AMP batch style reward (amp_share)
 
         # Core
         self.observations = torch.zeros(num_transitions_per_env, num_envs, *obs_shape, device=self.device)
@@ -77,6 +80,10 @@ class RolloutStorage:
         # For AMP reward combination (matching amp_roban_share)
         self.task_rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
         self.amp_rewards = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device)
+        if amp_obs_shape is not None:
+            self.amp_states = torch.zeros(num_transitions_per_env, num_envs, *amp_obs_shape, device=self.device)
+        else:
+            self.amp_states = None
         self.actions = torch.zeros(num_transitions_per_env, num_envs, *actions_shape, device=self.device)
         self.dones = torch.zeros(num_transitions_per_env, num_envs, 1, device=self.device).byte()
 
@@ -120,6 +127,8 @@ class RolloutStorage:
             self.task_rewards[self.step].copy_(transition.task_rewards.view(-1, 1))
         if transition.amp_rewards is not None:
             self.amp_rewards[self.step].copy_(transition.amp_rewards.view(-1, 1))
+        if self.amp_states is not None and transition.amp_states is not None:
+            self.amp_states[self.step].copy_(transition.amp_states)
         self.dones[self.step].copy_(transition.dones.view(-1, 1))
 
         # for distillation

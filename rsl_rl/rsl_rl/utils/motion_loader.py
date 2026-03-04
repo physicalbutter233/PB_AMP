@@ -18,16 +18,114 @@
 
 import glob
 import json
+import os
 
 import numpy as np
 import torch
 
 
+def _quat_apply(q, v):
+    """Apply quaternion q (w,x,y,z) to vector v. q: (..., 4), v: (..., 3)."""
+    qw, qx, qy, qz = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    return torch.stack(
+        [
+            (1 - 2 * (qy * qy + qz * qz)) * v[..., 0] + 2 * (qx * qy - qz * qw) * v[..., 1] + 2 * (qx * qz + qy * qw) * v[..., 2],
+            2 * (qx * qy + qz * qw) * v[..., 0] + (1 - 2 * (qx * qx + qz * qz)) * v[..., 1] + 2 * (qy * qz - qx * qw) * v[..., 2],
+            2 * (qx * qz - qy * qw) * v[..., 0] + 2 * (qy * qz + qx * qw) * v[..., 1] + (1 - 2 * (qx * qx + qy * qy)) * v[..., 2],
+        ],
+        dim=-1,
+    )
+
+
+def _quat_conjugate(q):
+    """q (w,x,y,z) -> conjugate."""
+    out = q.clone()
+    out[..., 1:4] = -out[..., 1:4]
+    return out
+
+
+def _quat_rotate_inverse(q, v):
+    """Rotate v by inverse of q. q: (..., 4), v: (..., 3)."""
+    return _quat_apply(_quat_conjugate(q), v)
+
+
+def _quat_to_gravity_3d(q):
+    """World gravity [0,0,-1] in body frame (amp_share 同款). q: (..., 4) wxyz."""
+    gravity_w = torch.zeros(*q.shape[:-1], 3, device=q.device, dtype=q.dtype)
+    gravity_w[..., 2] = -1.0
+    return _quat_rotate_inverse(q, gravity_w)
+
+
+def _load_npz_to_amp_64(device, path):
+    """Load amp_share-style .npz and convert to 64-dim AMP obs (same layout as PB_AMP roban).
+    Root rotation uses 3D gravity only. Returns (frames_tensor (T, 64), dt, num_frames).
+    """
+    data = np.load(path, allow_pickle=True)
+    dof_positions = torch.tensor(data["dof_positions"], dtype=torch.float32, device=device)
+    dof_velocities = torch.tensor(data["dof_velocities"], dtype=torch.float32, device=device)
+    body_positions = torch.tensor(data["body_positions"], dtype=torch.float32, device=device)
+    body_rotations = torch.tensor(data["body_rotations"], dtype=torch.float32, device=device)
+    body_linear_velocities = torch.tensor(data["body_linear_velocities"], dtype=torch.float32, device=device)
+    body_angular_velocities = torch.tensor(data["body_angular_velocities"], dtype=torch.float32, device=device)
+    body_names = data["body_names"].tolist()
+    dof_names = data["dof_names"].tolist()
+    fps = float(data["fps"])
+    dt = 1.0 / fps
+    T = dof_positions.shape[0]
+
+    ref_name = "base_link"
+    key_names = ["zarm_r4_link", "zarm_l4_link", "leg_r6_link", "leg_l6_link"]
+    ref_idx = body_names.index(ref_name)
+    key_idxs = [body_names.index(n) for n in key_names]
+
+    # Joint order for 21 DoF: waist, leg_l1..6, leg_r1..6, zarm_l1..4, zarm_r1..4 (match Roban S14)
+    order = (
+        ["waist_yaw_joint"]
+        + [f"leg_l{i}_joint" for i in range(1, 7)]
+        + [f"leg_r{i}_joint" for i in range(1, 7)]
+        + [f"zarm_l{i}_joint" for i in range(1, 5)]
+        + [f"zarm_r{i}_joint" for i in range(1, 5)]
+    )
+    dof_indexes = [dof_names.index(n) for n in order]
+
+    joint_pos_21 = dof_positions[:, dof_indexes]
+    joint_vel_21 = dof_velocities[:, dof_indexes]
+
+    root_pos = body_positions[:, ref_idx, :]
+    root_quat = body_rotations[:, ref_idx, :]
+    root_height = root_pos[:, 2:3]
+    root_gravity_3d = _quat_to_gravity_3d(root_quat)
+    root_lin_vel_w = body_linear_velocities[:, ref_idx, :]
+    root_ang_vel_w = body_angular_velocities[:, ref_idx, :]
+    root_lin_vel_b = _quat_rotate_inverse(root_quat, root_lin_vel_w)
+    root_ang_vel_b = _quat_rotate_inverse(root_quat, root_ang_vel_w)
+
+    key_pos_w = body_positions[:, key_idxs, :]
+    key_rel = key_pos_w - root_pos.unsqueeze(1)
+    root_quat_rep = root_quat.unsqueeze(1).expand(-1, 4, -1).reshape(T * 4, 4)
+    key_rel_flat = key_rel.reshape(T * 4, 3)
+    key_in_root = _quat_rotate_inverse(root_quat_rep, key_rel_flat).reshape(T, 12)
+
+    frames_64 = torch.cat(
+        (
+            joint_pos_21,
+            joint_vel_21,
+            root_height,
+            root_gravity_3d,
+            root_lin_vel_b,
+            root_ang_vel_b,
+            key_in_root,
+        ),
+        dim=-1,
+    )
+    return frames_64, dt, T
+
+
 class AMPLoader:
-    # Roban S14: 21 DoF (1 waist + 12 legs + 8 arms)
+    # Roban S14: 21 DoF (1 waist + 12 legs + 8 arms). AMP obs 64-dim (amp_share 同款)
     JOINT_POS_SIZE = 21
     JOINT_VEL_SIZE = 21
-    ROOT_STATE_SIZE = 13  # height(1) + rotation(6) + lin_vel(3) + ang_vel(3)
+    ROOT_STATE_SIZE = 10  # height(1) + gravity(3) + lin_vel(3) + ang_vel(3)
     END_EFFECTOR_POS_SIZE = 12
 
     JOINT_POSE_START_IDX = 0
@@ -49,12 +147,24 @@ class AMPLoader:
         data_dir="",
         preload_transitions=False,
         num_preload_transitions=1000000,
-        motion_files=glob.glob("datasets/motion_amp_expert/*"),
+        motion_files=None,
     ):
-        """Expert dataset provides AMP observations from Dog mocap dataset.
+        """Expert dataset provides AMP observations.
 
+        motion_files: list of paths, or dict {path: weight} (same as amp_share).
+        Supports .txt/.json (PB_AMP Frames format) and .npz (amp_share format).
         time_between_frames: Amount of time in seconds between transition.
         """
+        if motion_files is None:
+            motion_files = glob.glob("datasets/motion_amp_expert/*")
+        if isinstance(motion_files, dict):
+            motion_file_list = list(motion_files.keys())
+            weights_from_config = np.array(list(motion_files.values()), dtype=np.float64)
+            weights_from_config = weights_from_config / np.sum(weights_from_config)
+        else:
+            motion_file_list = list(motion_files)
+            weights_from_config = None
+
         self.device = device
         self.time_between_frames = time_between_frames
 
@@ -68,31 +178,56 @@ class AMPLoader:
         self.trajectory_frame_durations = []
         self.trajectory_num_frames = []
 
-        for i, motion_file in enumerate(motion_files):
-            self.trajectory_names.append(motion_file.split(".")[0])
-            with open(motion_file) as f:
-                motion_json = json.load(f)
-                motion_data = np.array(motion_json["Frames"])
-                # Remove first 7 observation dimensions (root_pos and root_orn).
-                self.trajectories.append(
-                    torch.tensor(motion_data[:, : AMPLoader.END_POS_END_IDX], dtype=torch.float32, device=device)
-                )
-                self.trajectories_full.append(
-                    torch.tensor(motion_data[:, : AMPLoader.END_POS_END_IDX], dtype=torch.float32, device=device)
-                )
+        for i, motion_file in enumerate(motion_file_list):
+            self.trajectory_names.append(os.path.splitext(os.path.basename(motion_file))[0])
+            if motion_file.lower().endswith(".npz"):
+                frames_64, dt, num_frames = _load_npz_to_amp_64(device, motion_file)
+                self.trajectories.append(frames_64)
+                self.trajectories_full.append(frames_64)
                 self.trajectory_idxs.append(i)
-                self.trajectory_weights.append(float(motion_json["MotionWeight"]))
-                frame_duration = float(motion_json["FrameDuration"])
-                self.trajectory_frame_durations.append(frame_duration)
-                traj_len = (motion_data.shape[0] - 1) * frame_duration
-                print(f"traj_len:{traj_len}")
+                w = float(weights_from_config[i]) if weights_from_config is not None else 1.0
+                self.trajectory_weights.append(w)
+                self.trajectory_frame_durations.append(dt)
+                traj_len = (num_frames - 1) * dt
                 self.trajectory_lens.append(traj_len)
-                self.trajectory_num_frames.append(float(motion_data.shape[0]))
-
-            print(f"Loaded {traj_len}s. motion from {motion_file}.")
+                self.trajectory_num_frames.append(float(num_frames))
+                print(f"Loaded {traj_len:.2f}s motion from {motion_file} (npz, weight={w:.3f}).")
+            else:
+                with open(motion_file) as f:
+                    motion_json = json.load(f)
+                    motion_data = np.array(motion_json["Frames"])
+                    num_cols = motion_data.shape[1]
+                    if num_cols == 67:
+                        # 旧 67 维格式：root_rotation 6D → 转为 64 维（用 normal 取反得 gravity）
+                        # [0:43], -[46:49], [49:67] -> 43+3+18=64
+                        part0 = motion_data[:, :43]
+                        normal = motion_data[:, 46:49]
+                        gravity_3d = -normal
+                        part1 = motion_data[:, 49:67]
+                        frames_64 = np.concatenate([part0, gravity_3d, part1], axis=1)
+                        motion_tensor = torch.tensor(frames_64, dtype=torch.float32, device=device)
+                    else:
+                        motion_tensor = torch.tensor(
+                            motion_data[:, : AMPLoader.END_POS_END_IDX], dtype=torch.float32, device=device
+                        )
+                    self.trajectories.append(motion_tensor)
+                    self.trajectories_full.append(motion_tensor)
+                    self.trajectory_idxs.append(i)
+                    if weights_from_config is not None:
+                        w = float(weights_from_config[i])
+                    else:
+                        w = float(motion_json.get("MotionWeight", 1.0))
+                    self.trajectory_weights.append(w)
+                    frame_duration = float(motion_json["FrameDuration"])
+                    self.trajectory_frame_durations.append(frame_duration)
+                    traj_len = (motion_data.shape[0] - 1) * frame_duration
+                    self.trajectory_lens.append(traj_len)
+                    self.trajectory_num_frames.append(float(motion_data.shape[0]))
+                    print(f"Loaded {traj_len:.2f}s motion from {motion_file} (weight={w:.3f}).")
 
         # Trajectory weights are used to sample some trajectories more than others.
-        self.trajectory_weights = np.array(self.trajectory_weights) / np.sum(self.trajectory_weights)
+        self.trajectory_weights = np.array(self.trajectory_weights, dtype=np.float64)
+        self.trajectory_weights = self.trajectory_weights / np.sum(self.trajectory_weights)
         self.trajectory_frame_durations = np.array(self.trajectory_frame_durations)
         self.trajectory_lens = np.array(self.trajectory_lens)
         self.trajectory_num_frames = np.array(self.trajectory_num_frames)

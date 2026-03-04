@@ -127,6 +127,7 @@ class AMPPPO:
         self.style_reward_weight = 0.02
         self.discriminator_reward_scale = 2.0
         self.use_amp_reward_combination = False  # Flag to enable new reward combination
+        self._last_rollout_mean_style_reward = 0.0  # For logging (set in compute_returns)
 
         # PPO components
         self.policy = policy
@@ -160,12 +161,14 @@ class AMPPPO:
     def init_storage(
         self, training_type, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, actions_shape
     ):
-        # create memory for RND as well :)
         if self.rnd:
             rnd_state_shape = [self.rnd.num_states]
         else:
             rnd_state_shape = None
-        # create rollout storage
+        # amp_share: store amp_states in rollout for batch style reward in compute_returns
+        amp_obs_shape = None
+        if self.use_amp_reward_combination and hasattr(self.discriminator, "input_dim"):
+            amp_obs_shape = [self.discriminator.input_dim // 2]
         self.storage = RolloutStorage(
             training_type,
             num_envs,
@@ -175,7 +178,9 @@ class AMPPPO:
             actions_shape,
             rnd_state_shape,
             self.device,
+            amp_obs_shape=amp_obs_shape,
         )
+        self._initial_amp_obs_rollout = None
 
     def act(self, obs, critic_obs, amp_obs):
         if self.policy.is_recurrent:
@@ -198,15 +203,24 @@ class AMPPPO:
         self.transition.dones = dones
         
         # Store task and AMP rewards separately for combination during training (matching amp_roban_share)
-        if self.use_amp_reward_combination and task_rewards is not None and amp_rewards is not None:
+        if self.use_amp_reward_combination:
             # Store task and AMP rewards separately (matching amp_roban_share)
-            self.transition.task_rewards = task_rewards.clone()
-            self.transition.amp_rewards = amp_rewards.clone()
-            # Use task rewards for bootstrapping (matching amp_roban_share: bootstrapping on task rewards)
-            self.transition.rewards = rewards.clone()  # rewards is task_rewards at this point
+            self.transition.task_rewards = (task_rewards if task_rewards is not None else rewards).clone()
+            self.transition.amp_rewards = None
+            self.transition.amp_states = amp_obs.clone()
+            self.transition.rewards = self.transition.task_rewards.clone()
+            if self.storage.step == 0:
+                self._initial_amp_obs_rollout = self.amp_transition.observations.clone()
         else:
-            # Old mode: use rewards as-is
-            self.transition.rewards = rewards.clone()
+            self.transition.amp_states = None
+            if task_rewards is not None and amp_rewards is not None:
+                self.transition.task_rewards = task_rewards.clone()
+                self.transition.amp_rewards = amp_rewards.clone()
+                self.transition.rewards = rewards.clone()
+            else:
+                self.transition.rewards = rewards.clone()
+                self.transition.task_rewards = None
+                self.transition.amp_rewards = None
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
@@ -234,17 +248,31 @@ class AMPPPO:
         self.policy.reset(dones)
 
     def compute_returns(self, last_critic_obs):
-        # Combine task and AMP rewards if using new reward combination (matching amp_roban_share)
-        # Matching amp_roban_share: combination happens here, before computing returns
-        if self.use_amp_reward_combination and self.storage.task_rewards is not None and self.storage.amp_rewards is not None:
-            # Compute combined rewards: task_reward_weight * task_reward + style_reward_weight * style_reward
-            # Note: task_rewards already include bootstrapping (applied in process_env_step)
-            # We combine after bootstrapping, matching amp_roban_share behavior
-            self.storage.rewards = (
-                self.task_reward_weight * self.storage.task_rewards +
-                self.style_reward_weight * self.storage.amp_rewards
+        # amp_share: compute style reward in batch from stored amp_states, then combine (no per-step discriminator)
+        if self.use_amp_reward_combination and self.storage.amp_states is not None and self._initial_amp_obs_rollout is not None:
+            T, N = self.storage.num_transitions_per_env, self.storage.num_envs
+            # current state for step t = initial if t==0 else amp_states[t-1]
+            current = torch.cat(
+                [self._initial_amp_obs_rollout.unsqueeze(0), self.storage.amp_states[:-1]],
+                dim=0
             )
-        
+            next_s = self.storage.amp_states
+            current_flat = current.reshape(T * N, -1)
+            next_flat = next_s.reshape(T * N, -1)
+            style_reward_flat, _ = self.discriminator.predict_style_reward(
+                current_flat, next_flat,
+                normalizer=self.amp_normalizer,
+                reward_scale=self.discriminator_reward_scale,
+            )
+            style_reward = style_reward_flat.reshape(T, N, 1).to(self.storage.rewards.device)
+            self._last_rollout_mean_style_reward = style_reward.mean().item()
+            self.storage.rewards = (
+                self.task_reward_weight * self.storage.task_rewards
+                + self.style_reward_weight * style_reward
+            )
+        else:
+            self._last_rollout_mean_style_reward = 0.0
+
         # compute value for the last step
         last_values = self.policy.evaluate(last_critic_obs).detach()
         self.storage.compute_returns(
