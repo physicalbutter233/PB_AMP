@@ -70,7 +70,7 @@ def play():
     resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
     log_dir = os.path.dirname(resume_path)
 
-    # 首先创建运行环境（用于加载训练时的模型）
+    # 首先创建运行环境（用于加载训练时的模型，与 amp_share Roban AMP play 对齐）
     env_cfg.noise.add_noise = False
     env_cfg.domain_rand.events.push_robot = None
     env_cfg.scene.max_episode_length_s = 40.0
@@ -83,6 +83,9 @@ def play():
     # 禁用速度课程：否则 _apply_velocity_level(0) 会覆盖上面的 ranges
     if hasattr(env_cfg, "velocity_curriculum") and env_cfg.velocity_curriculum is not None:
         env_cfg.velocity_curriculum.enable = False
+    # 禁用地形+推力课程（play 不需要课程更新，与 amp_share PLAY 一致）
+    if hasattr(env_cfg, "terrain_force_curriculum") and env_cfg.terrain_force_curriculum is not None:
+        env_cfg.terrain_force_curriculum.enable = False
     env_cfg.scene.height_scanner.drift_range = (0.0, 0.0)
     env_cfg.scene.terrain_generator = None
     env_cfg.scene.terrain_type = "plane"

@@ -127,6 +127,13 @@ class NoiseCfg:
 
 @configclass
 class EventCfg:
+    """环境通用事件配置。
+
+    - 默认字段保持与原 PB_AMP 一致；
+    - 新增若干可选字段（scale_link_mass 等），供 Roban 等任务覆盖使用。
+    """
+
+    # 原有默认事件（保持行为不变）
     physics_material = EventTerm(
         func=mdp.randomize_rigid_body_material,
         mode="startup",
@@ -142,7 +149,8 @@ class EventCfg:
         func=mdp.randomize_rigid_body_mass,
         mode="startup",
         params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
+            # 使用 ".*" 匹配所有刚体，而不是 MISSING，避免 SceneEntityCfg 在解析 body_names 时出错
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
             "mass_distribution_params": (-5.0, 5.0),
             "operation": "add",
         },
@@ -176,6 +184,13 @@ class EventCfg:
         interval_range_s=(10.0, 15.0),
         params={"velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)}},
     )
+
+    # 供特定任务（如 Roban）覆盖的可选事件；默认 None，不会被使用
+    scale_link_mass: EventTerm | None = None
+    randomize_rigid_body_com: EventTerm | None = None
+    scale_actuator_gains: EventTerm | None = None
+    scale_joint_parameters: EventTerm | None = None
+    base_external_force_torque: EventTerm | None = None
 
 
 @configclass

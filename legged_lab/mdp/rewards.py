@@ -60,6 +60,40 @@ def ang_vel_xy_l2(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneE
     return torch.sum(torch.square(asset.data.root_ang_vel_b[:, :2]), dim=1)
 
 
+def ang_acc_xy_l2(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """与 amp_roban_share 等价的 xy 平面角加速度 L2 惩罚。
+
+    - 使用世界系下质心角速度 `root_com_ang_vel_w[:, :2]`（roll, pitch 分量）；
+    - 通过 (vel_t - vel_{t-1}) / dt 近似角加速度；
+    - 返回每个 env 的 L2^2 惩罚（需配合负权重使用，如 -5e-5）。
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    # 当前 roll/pitch 角速度（世界系）
+    ang_vel = asset.data.root_com_ang_vel_w[:, :2]
+
+    # 初始化上一时刻角速度缓存
+    if not hasattr(env, "_prev_ang_vel_xy"):
+        env._prev_ang_vel_xy = ang_vel.clone()
+
+    # 角加速度近似
+    ang_acc = (ang_vel - env._prev_ang_vel_xy) / env.step_dt
+    env._prev_ang_vel_xy = ang_vel.clone()
+
+    # L2 penalty
+    return torch.sum(torch.square(ang_acc), dim=1)
+
+
+def joint_power_l2(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """与 amp_roban_share 等价的关节功率 L2 惩罚。
+
+    使用 (applied_torque * joint_vel) 计算每个关节的瞬时功率，并对指定关节求绝对值和。
+    返回正值（功率越大越大），需配合负权重使用。
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_power = asset.data.applied_torque[:, asset_cfg.joint_ids] * asset.data.joint_vel[:, asset_cfg.joint_ids]
+    return torch.sum(torch.abs(joint_power), dim=1)
+
+
 def energy(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
     reward = torch.norm(torch.abs(asset.data.applied_torque * asset.data.joint_vel), dim=-1)
@@ -71,6 +105,46 @@ def joint_acc_l2(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEn
     return torch.sum(torch.square(asset.data.joint_acc[:, asset_cfg.joint_ids]), dim=1)
 
 
+def joint_mean_acc_l2(
+    env: BaseEnv | TienKungEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    threshold: float = 8000.0,
+) -> torch.Tensor:
+    """与 amp_roban_share 等价的“平均关节加速度 L2”惩罚。
+
+    - 使用 (joint_vel_t - joint_vel_{t-1}) / dt 近似每个关节的加速度；
+    - 对平方加速度减去阈值后 clamp 到 [0, 7500]，再对关节求和；
+    - 返回值需配合负权重（如 -6e-6）使用。
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    # 当前速度
+    joint_vel = asset.data.joint_vel
+    # 上一时刻速度缓存
+    if not hasattr(env, "_prev_joint_vel_for_acc"):
+        env._prev_joint_vel_for_acc = joint_vel.clone()
+    square_acc = torch.square((joint_vel - env._prev_joint_vel_for_acc) / env.step_dt)
+    # 与 amp_roban_share 一致：减去阈值后 clamp 到 [0, 7500]
+    square_acc = torch.clamp(square_acc - threshold, min=0.0, max=7500.0)
+    acc_l2 = torch.sum(square_acc[:, asset_cfg.joint_ids], dim=1)
+    env._prev_joint_vel_for_acc = joint_vel.clone()
+    return acc_l2
+
+
+def joint_pos_limits(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """与 IsaacLab/amp_roban_share 等价的软关节位置限幅惩罚。
+
+    使用 ArticulationData.soft_joint_pos_limits 作为软限幅，超出部分累加为正惩罚。
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    out_of_limits = -(
+        asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.soft_joint_pos_limits[:, asset_cfg.joint_ids, 0]
+    ).clip(max=0.0)
+    out_of_limits += (
+        asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.soft_joint_pos_limits[:, asset_cfg.joint_ids, 1]
+    ).clip(min=0.0)
+    return torch.sum(out_of_limits, dim=1)
+
+
 def action_rate_l2(env: BaseEnv | TienKungEnv) -> torch.Tensor:
     return torch.sum(
         torch.square(
@@ -78,6 +152,24 @@ def action_rate_l2(env: BaseEnv | TienKungEnv) -> torch.Tensor:
         ),
         dim=1,
     )
+
+
+def action_smoothness_l2(env: BaseEnv | TienKungEnv) -> torch.Tensor:
+    """与 amp_roban_share 等价的三点差分动作平滑惩罚。
+
+    使用当前动作、上一步动作、上上步动作：
+        a_t - 2 * a_{t-1} + a_{t-2}
+    的 L2 范数平方作为平滑性成本（需配合负权重使用）。
+    """
+    buf = env.action_buffer._circular_buffer.buffer
+    # 需要至少 3 步历史；若不足则返回 0
+    if buf.shape[1] < 3:
+        return torch.zeros(env.num_envs, device=buf.device)
+    a_t = buf[:, -1, :]
+    a_t_1 = buf[:, -2, :]
+    a_t_2 = buf[:, -3, :]
+    smooth = a_t - 2.0 * a_t_1 + a_t_2
+    return torch.sum(torch.square(smooth), dim=1)
 
 
 def undesired_contacts(env: BaseEnv | TienKungEnv, threshold: float, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
@@ -99,6 +191,28 @@ def flat_orientation_l2(
 ) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
     return torch.sum(torch.square(asset.data.projected_gravity_b[:, :2]), dim=1)
+
+
+def orientation_l2(
+    env: BaseEnv | TienKungEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    command_name: str = "base_velocity",
+    angular_threshold: float = 0.1,
+) -> torch.Tensor:
+    """与 amp_roban_share 等价的“直行时关节偏移惩罚”（orientation_l2）。
+
+    - 当 yaw 命令 |ω_cmd| < angular_threshold 时，惩罚关节相对默认位置的 L1 偏移；
+    - 转弯时（|ω_cmd| 较大）不施加惩罚，给关节更多自由度。
+    """
+    cmd = env.command_generator.command
+    ang_vel_cmd = cmd[:, 2]
+    is_straight = torch.abs(ang_vel_cmd) < angular_threshold
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    joint_pos_default = asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    deviation = torch.sum(torch.abs(joint_pos - joint_pos_default), dim=1)
+    return torch.where(is_straight, deviation, torch.zeros_like(deviation))
 
 
 def is_terminated(env: BaseEnv | TienKungEnv) -> torch.Tensor:
@@ -144,6 +258,230 @@ def stand_still_penalty(
     return penalty * should_stand.float()
 
 
+def stand_static_vel_without_cmd(
+    env: BaseEnv,
+    command_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    cmd_threshold: float = 0.05,
+    ext_force_threshold: float = 10.0,
+) -> torch.Tensor:
+    """与 amp_roban_share 等价的“无命令静止速度惩罚”。
+
+    - 当速度命令接近 0 且外力较小时，惩罚所有关节的速度（L1 范数）；
+    - 鼓励在无命令时机器人关节完全静止。
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_vel = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    vel_penalty = torch.sum(torch.abs(joint_vel), dim=-1)
+
+    command = env.command_generator.command
+    is_static_cmd = (torch.norm(command[:, :2], dim=1) < cmd_threshold) & (
+        torch.abs(command[:, 2]) < cmd_threshold
+    )
+
+    if hasattr(asset, "_external_force_b"):
+        is_low_ext_force = torch.norm(asset._external_force_b[:, 0, :], dim=1) < ext_force_threshold
+    else:
+        is_low_ext_force = torch.ones_like(is_static_cmd, dtype=torch.bool)
+
+    valid_mask = is_static_cmd & is_low_ext_force
+    return vel_penalty * valid_mask.float()
+
+
+def stand_still_without_cmd(
+    env: BaseEnv | TienKungEnv,
+    command_name: str = "base_velocity",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """与 amp_roban_share 等价的“无命令时关节偏移惩罚”。
+
+    - 当线速度命令和角速度命令都很小且外力不大时：
+      惩罚关节相对默认位置的 L1 偏移；
+    - 用于鼓励在无速度命令下机器人尽量回到默认站姿。
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    diff_angle = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    reward = torch.sum(torch.abs(diff_angle), dim=-1)
+
+    cmd = env.command_generator.command
+    lin_ok = torch.norm(cmd[:, :2], dim=1) < 0.1
+    ang_ok = torch.abs(cmd[:, 2]) < 0.1
+    if hasattr(asset, "_external_force_b"):
+        ext_ok = torch.norm(asset._external_force_b[:, 0, :], dim=1) < 20.0
+    else:
+        ext_ok = torch.ones_like(lin_ok, dtype=torch.bool)
+
+    mask = lin_ok & ang_ok & ext_ok
+    return reward * mask.float()
+
+
+def feet_parallel_when_standing(
+    env: BaseEnv | TienKungEnv,
+    command_name: str = "base_velocity",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="leg_[l,r]6_link"),
+    std: float = 0.02,
+) -> torch.Tensor:
+    """与 amp_roban_share 等价：静止站立时奖励双脚在根坐标系 x 方向对齐（平行）。
+
+    - 仅在线速度/角速度命令都很小（站立指令）时激活；
+    - 在机器人根坐标系下，比较左右脚 x 坐标的差异，差越小奖励越高（高斯核）。
+    """
+    cmd = env.command_generator.command
+    is_standing_still = (
+        (torch.abs(cmd[:, 0]) < 0.1)
+        & (torch.abs(cmd[:, 1]) < 0.1)
+        & (torch.abs(cmd[:, 2]) < 0.1)
+    )
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    feet_pos_w = asset.data.body_pos_w[:, asset_cfg.body_ids, :]  # [N,2,3]
+    root_pos = asset.data.root_pos_w
+    left_rel = feet_pos_w[:, 0, :] - root_pos
+    right_rel = feet_pos_w[:, 1, :] - root_pos
+
+    root_quat = asset.data.root_quat_w
+    left_root = math_utils.quat_rotate_inverse(root_quat, left_rel)
+    right_root = math_utils.quat_rotate_inverse(root_quat, right_rel)
+
+    left_x = left_root[:, 0]
+    right_x = right_root[:, 0]
+    x_err = torch.abs(left_x - right_x)
+    parallel_reward = torch.exp(-torch.square(x_err) / (std**2))
+
+    return torch.where(is_standing_still, parallel_reward, torch.zeros_like(parallel_reward))
+
+
+def foot_lift_height_during_rotation(
+    env: BaseEnv | TienKungEnv,
+    command_name: str,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_height: float = 0.06,
+    height_tolerance: float = 0.02,
+    rotation_threshold: float = 0.1,
+    linear_threshold: float = 0.1,
+    max_air_time: float = 0.3,
+) -> torch.Tensor:
+    """与 amp_roban_share 等价的 foot_lift_height_during_rotation 奖励。
+
+    - 原地旋转 / 侧走时：鼓励单脚支撑 + 单脚抬到目标高度；
+    - 仅在 `is_rotating_or_steponplace & one_foot_support` 且 air_time 合法时生效。
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    # 获取命令（PB_AMP 使用 command_generator）
+    cmd = env.command_generator.command
+    lin_vel_x = cmd[:, 0]
+    lin_vel_y = cmd[:, 1]
+    ang_vel_z = cmd[:, 2]
+
+    # 原地旋转 或 侧向行走
+    is_rotating_or_steponplace = (
+        (torch.abs(ang_vel_z) > rotation_threshold)
+        & (torch.abs(lin_vel_x) < linear_threshold)
+        & (torch.abs(lin_vel_y) < linear_threshold)
+    ) | (
+        (torch.abs(ang_vel_z) < rotation_threshold)
+        & (torch.abs(lin_vel_x) < linear_threshold)
+        & (torch.abs(lin_vel_y) > linear_threshold)
+    )
+
+    # 抬腿时间不能过长
+    is_air_time_valid = (
+        contact_sensor.data.current_air_time[:, sensor_cfg.body_ids] < max_air_time
+    )
+
+    # 脚高度
+    feet_height = asset.data.body_pos_w[:, asset_cfg.body_ids, 2]
+
+    # 接触状态
+    in_contact = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, 2] > 5.0
+    num_feet_in_contact = torch.sum(in_contact.float(), dim=1)
+    one_foot_support = num_feet_in_contact == 1
+
+    # 高度奖励（高斯核）
+    height_error = torch.abs(feet_height - target_height)
+    height_reward = torch.exp(-torch.square(height_error / height_tolerance))
+
+    # 只对离地脚且 air_time 合法的脚给奖励
+    lift_reward = torch.where(~in_contact, height_reward, torch.zeros_like(height_reward))
+    lift_reward = torch.where(is_air_time_valid, lift_reward, torch.zeros_like(lift_reward))
+    lift_reward_sum = torch.sum(lift_reward, dim=1)
+
+    reward = torch.where(
+        is_rotating_or_steponplace & one_foot_support,
+        lift_reward_sum,
+        torch.zeros_like(lift_reward_sum),
+    )
+    return reward
+
+
+def fft_dof_symmetry(
+    env: BaseEnv | TienKungEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    joint_names_pairs: list[str] | None = None,
+    angular_threshold: float = 0.8,
+    command_name: str = "base_velocity",
+) -> torch.Tensor:
+    """与 amp_roban_share 等价的关节频域对称性惩罚。
+
+    - 对每对左右关节，维护一段动作历史（当前 + 前 99 步），在时间维上做 FFT；
+    - 比较左右关节在频域上的幅值差异，差异越大 → 惩罚越大（返回负值）；
+    - 外力较大或大角速度转弯时弱化惩罚。
+    """
+    if joint_names_pairs is None:
+        joint_names_pairs = ["leg_[l,r]6_joint"]
+
+    # 初始化历史缓存：[num_envs, num_pairs*2, history_len]
+    history_len = 100
+    if not hasattr(env, "joint_action_history_sym"):
+        env.joint_action_history_sym = torch.zeros(
+            env.num_envs, len(joint_names_pairs) * 2, history_len, device=env.device
+        )
+    env.joint_action_history_sym = torch.roll(env.joint_action_history_sym, 1, dims=2)
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    symmetry_metric = torch.zeros(env.num_envs, device=env.device)
+
+    # 当前动作（假定与关节顺序一致）
+    actions = env.action  # [num_envs, num_actions]
+
+    for i, joint_pair in enumerate(joint_names_pairs):
+        joint_idxs = asset.find_joints(joint_pair)[0]
+        # asset.find_joints 返回的是 Python 列表，这里按 amp_share 语义要求必须是成对关节
+        if len(joint_idxs) != 2:
+            continue
+        joint_action = actions[:, joint_idxs]  # [N, 2]
+        env.joint_action_history_sym[:, i * 2 : i * 2 + 2, 0] = joint_action
+
+        joint_history = env.joint_action_history_sym[:, i * 2 : i * 2 + 2]  # [N,2,T]
+        joint_history_centered = joint_history - joint_history.mean(dim=2, keepdim=True)
+
+        fft_vals = torch.fft.rfft(joint_history_centered, dim=2)
+        fft_magnitudes = torch.abs(fft_vals)
+
+        freq_diff = torch.abs(fft_magnitudes[:, 0, :] - fft_magnitudes[:, 1, :])
+        topk = min(20, freq_diff.shape[1])
+        topk_vals = torch.topk(freq_diff, k=topk, dim=1).values
+        symmetry_metric += torch.sum(topk_vals, dim=1)
+
+    # 外力与大角速度下削弱惩罚
+    if hasattr(asset, "_external_force_b"):
+        without_external_force_apply = torch.norm(asset._external_force_b[:, 0, :], dim=1) < 5.0
+    else:
+        without_external_force_apply = torch.ones_like(symmetry_metric, dtype=torch.bool)
+
+    cmd = env.command_generator.command
+    big_angular = torch.abs(cmd[:, 2]) > angular_threshold
+
+    symmetry_metric = symmetry_metric * without_external_force_apply
+    symmetry_metric[big_angular] = symmetry_metric[big_angular] * 0.5
+
+    # 返回负惩罚，clip 上限与 amp_roban_share 一致
+    return -torch.clamp(symmetry_metric, max=300.0)
+
+
 def feet_air_time_positive_biped(
     env: BaseEnv | TienKungEnv, threshold: float, sensor_cfg: SceneEntityCfg
 ) -> torch.Tensor:
@@ -173,6 +511,34 @@ def feet_slide(
     return reward
 
 
+def feet_slide_yaw(
+    env: BaseEnv | TienKungEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    command_name: str = "base_velocity",
+) -> torch.Tensor:
+    """与 amp_roban_share 等价的足部转动滑移惩罚（yaw 方向）。
+
+    - 只在有接触的脚上，根据身体各脚链接的 yaw 角速度大小惩罚；
+    - 仅在有 yaw 命令（转向指令幅值 > 0.1）时激活。
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    contacts = (
+        contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+        .norm(dim=-1)
+        .max(dim=1)[0]
+        > 1.0
+    )
+    asset: Articulation = env.scene[asset_cfg.name]
+    body_ang_vel_z = asset.data.body_ang_vel_w[:, sensor_cfg.body_ids, 2:3]
+    reward_ang_vel = torch.sum(body_ang_vel_z.norm(dim=-1) * contacts, dim=1)
+    # 仅在有非零 yaw 命令时启用
+    cmd = env.command_generator.command
+    has_yaw_cmd = torch.abs(cmd[:, 2]) > 0.1
+    reward_ang_vel = reward_ang_vel * has_yaw_cmd.float()
+    return reward_ang_vel
+
+
 def body_force(
     env: BaseEnv | TienKungEnv, sensor_cfg: SceneEntityCfg, threshold: float = 500, max_reward: float = 400
 ) -> torch.Tensor:
@@ -184,6 +550,32 @@ def body_force(
     return reward
 
 
+def gravity_aligned_when_stopping(
+    env: BaseEnv | TienKungEnv,
+    command_name: str = "base_velocity",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=["leg_[l,r]6_joint"]),
+    std: float = 0.25,
+) -> torch.Tensor:
+    """与 amp_roban_share 等价的“停止时重力对齐”奖励。
+
+    - 当速度命令几乎为 0 时，奖励躯干姿态与重力方向对齐（即站直）；
+    - 使用 pitch 角的高斯奖励，pitch 越接近 0 奖励越高。
+    """
+    cmd = env.command_generator.command
+    is_zero_cmd = torch.norm(cmd[:, :2], dim=1) < 0.1
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    root_quat = asset.data.root_quat_w
+    w, x, y, z = root_quat[:, 0], root_quat[:, 1], root_quat[:, 2], root_quat[:, 3]
+    # 近似提取 pitch 角（与 amp_share 中实现保持一致，带微小偏移）
+    pitch = torch.asin(2.0 * (w * y - x * z)) - 0.02
+    reward = torch.exp(-torch.square(pitch) / std)
+
+    masked_reward = torch.zeros_like(reward)
+    masked_reward[is_zero_cmd] = reward[is_zero_cmd]
+    return masked_reward
+
+
 def joint_deviation_l1(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
     angle = asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids]
@@ -191,6 +583,135 @@ def joint_deviation_l1(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = S
         torch.norm(env.command_generator.command[:, :2], dim=1) + torch.abs(env.command_generator.command[:, 2])
     ) < 0.1
     return torch.sum(torch.abs(angle), dim=1) * zero_flag
+
+
+def joint_deviation_l1_straight_only(
+    env: BaseEnv | TienKungEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    command_name: str = "base_velocity",
+    angular_threshold: float = 0.1,
+) -> torch.Tensor:
+    """与 amp_roban_share 等价：仅在“直行”时惩罚关节偏离默认。
+
+    - yaw 命令 |ω_cmd| < angular_threshold 时：
+        deviation = ∑ |joint_pos - default_joint_pos|
+    - 转弯时（|ω_cmd| 较大）不施加惩罚（返回 0），允许关节有更多自由度。
+    """
+    cmd = env.command_generator.command
+    ang_vel_cmd = cmd[:, 2]
+    is_straight = torch.abs(ang_vel_cmd) < angular_threshold
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    joint_pos_default = asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+    deviation = torch.sum(torch.abs(joint_pos - joint_pos_default), dim=1)
+    return torch.where(is_straight, deviation, torch.zeros_like(deviation))
+
+
+def joint_vel_l2(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """与 amp_roban_share 等价：关节速度 L2 惩罚。
+
+    使用 joint_vel 相对于默认速度（通常为 0）的平方和，需配合负权重使用。
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    joint_vel = asset.data.joint_vel[:, asset_cfg.joint_ids]
+    return torch.sum(torch.square(joint_vel), dim=1)
+
+
+def feet_pos_acc_l2(
+    env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """与 amp_roban_share 等价：脚部位置加速度 L2 惩罚。
+
+    - 使用 body_pos_w 计算脚的速度和加速度；
+    - 对加速度 clamp 后平方求和。
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    feet_pos = asset.data.body_pos_w[:, asset_cfg.body_ids, :]
+
+    if not hasattr(env, "_prev_feet_pos"):
+        env._prev_feet_pos = feet_pos.clone()
+
+    feet_vel = (feet_pos - env._prev_feet_pos) / env.step_dt
+
+    if not hasattr(env, "_prev_feet_vel"):
+        env._prev_feet_vel = feet_vel.clone()
+
+    feet_acc = (feet_vel - env._prev_feet_vel) / env.step_dt
+    feet_acc = torch.clamp(feet_acc, min=-30.0, max=30.0)
+
+    env._prev_feet_pos = feet_pos.clone()
+    env._prev_feet_vel = feet_vel.clone()
+
+    return torch.sum(torch.square(feet_acc), dim=(1, 2))
+
+
+def knee_pos_acc_l2(
+    env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """与 amp_roban_share 等价：膝盖位置加速度 L2 惩罚。"""
+    asset: Articulation = env.scene[asset_cfg.name]
+    knee_pos = asset.data.body_pos_w[:, asset_cfg.body_ids, :]
+
+    if not hasattr(env, "_prev_knee_pos"):
+        env._prev_knee_pos = knee_pos.clone()
+
+    knee_vel = (knee_pos - env._prev_knee_pos) / env.step_dt
+
+    if not hasattr(env, "_prev_knee_vel"):
+        env._prev_knee_vel = knee_vel.clone()
+
+    knee_acc = (knee_vel - env._prev_knee_vel) / env.step_dt
+    knee_acc = torch.clamp(knee_acc, min=-30.0, max=30.0)
+
+    env._prev_knee_pos = knee_pos.clone()
+    env._prev_knee_vel = knee_vel.clone()
+
+    return torch.sum(torch.square(knee_acc), dim=(1, 2))
+
+
+def knee_pos_z_limit(
+    env: BaseEnv | TienKungEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    knee_z_limit: float = 0.58,
+) -> torch.Tensor:
+    """与 amp_roban_share 等价：膝盖高度超限惩罚。
+
+    - 若膝盖的 z 高度超过 knee_z_limit，则对超出部分做二次惩罚；
+    - 用于约束膝盖过高抬起，保持自然行走姿态。
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    knee_pos = asset.data.body_pos_w[:, asset_cfg.body_ids, :]  # [N, n_knee, 3]
+    knee_z = knee_pos[:, :, 2]
+    excess = (knee_z - knee_z_limit).clamp(min=0.0)
+    return torch.sum(torch.square(excess), dim=1)
+
+
+def knee_ankle_y_position_difference(
+    env: BaseEnv | TienKungEnv,
+    knee_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="leg_[l,r]4_link"),
+    ankle_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="leg_[l,r]6_link"),
+) -> torch.Tensor:
+    """与 amp_roban_share 等价的膝盖-脚踝 y 方向位置差惩罚。
+
+    计算在机器人根坐标系下，左右两条腿膝盖和脚踝 y 方向位置差的绝对值之和。
+    返回正值（差越大越大），需配合负权重使用。
+    """
+    asset: Articulation = env.scene["robot"]
+    # 世界系下 body 位置
+    knee_pos_w = asset.data.body_link_pos_w[:, knee_cfg.body_ids, :]
+    ankle_pos_w = asset.data.body_link_pos_w[:, ankle_cfg.body_ids, :]
+    # 根姿态
+    root_quat = asset.data.root_link_quat_w
+    # 转到根坐标系
+    knee_body = math_utils.quat_rotate_inverse(root_quat.unsqueeze(1), knee_pos_w)
+    ankle_body = math_utils.quat_rotate_inverse(root_quat.unsqueeze(1), ankle_pos_w)
+    # 取 y 分量
+    knee_y = knee_body[:, :, 1]
+    ankle_y = ankle_body[:, :, 1]
+    y_diff = torch.abs(knee_y - ankle_y)
+    total_y_diff = torch.sum(y_diff, dim=1)
+    return total_y_diff
 
 
 def joint_pos_tracking_l2(
@@ -621,35 +1142,27 @@ def contact_momentum(
 ) -> torch.Tensor:
     """Reward gentle (low vertical velocity) foot landing.
 
-    着地瞬间脚部的垂直速度应该尽量小。砸地式落脚会产生冲击，
-    不利于稳定行走，也不自然。
-
-    仅在 first_contact 时给出奖励：
-        reward = exp(-(v_z)² / std²) * first_contact
-
-    v_z 被 clamp 到 [-10, 0]（只关注下落方向）。
-    v_z ≈ 0 时奖励最大（轻柔落地）。
-
-    amp_roban_share 参考值：weight=1.0(?), std=0.05
+    与 amp_roban_share 等价的 contact_momentum：
+    - 只考虑脚部在 z 方向的速度；
+    - 在 first_contact 时，根据 v_z 大小给出 exp(-v_z^2 / std^2) 奖励；
+    - 仅在有运动指令时激活。
     """
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
-    first_contact = contact_sensor.compute_first_contact(env.step_dt)[:, sensor_cfg.body_ids]  # [batch, 2]
+    first_contact = contact_sensor.compute_first_contact(env.step_dt)[:, sensor_cfg.body_ids]  # [N, feet]
 
     asset: Articulation = env.scene[asset_cfg.name]
-    # 脚部垂直速度（世界坐标系 z 方向）
-    body_vel_z = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, 2]  # [batch, 2]
-    # 只关注下落方向（负速度）
+    # 使用 sensor_cfg.body_ids 对齐脚部索引，避免与 asset_cfg.body_ids 维度不一致
+    body_vel_z = asset.data.body_lin_vel_w[:, sensor_cfg.body_ids, 2]  # [N, feet]
     body_vel_z = torch.clamp(body_vel_z, min=-10.0, max=0.0)
 
-    reward = torch.exp(-torch.square(body_vel_z / std)) * first_contact
+    reward = torch.exp(-torch.square(body_vel_z / std)) * first_contact  # [N, feet]
+    reward_sum = torch.sum(reward, dim=1)  # [N]
 
-    result = torch.sum(reward, dim=1)
-    # 只在有速度指令时激活
     has_command = (
         torch.norm(env.command_generator.command[:, :2], dim=1)
         + torch.abs(env.command_generator.command[:, 2])
     ) > 0.1
-    return result * has_command
+    return reward_sum * has_command.float()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -765,6 +1278,32 @@ def feet_air_time_clip_biped(
         + torch.abs(env.command_generator.command[:, 2])
     ) > 0.1
     return reward
+
+
+def feet_air_time_clip(
+    env: BaseEnv | TienKungEnv,
+    command_name: str = "base_velocity",
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_sensor"),
+    threshold_min: float = 0.25,
+    threshold_max: float = 0.45,
+) -> torch.Tensor:
+    """与 amp_roban_share 等价的 feet_air_time_clip 实现。
+
+    - 使用 last_air_time（上一次完整空中相时长）和 first_contact（刚着地）；
+    - 对 (last_air_time - threshold_min) 做下截断，超过 threshold_max-threshold_min 的部分剪裁；
+    - 仅在有速度命令时激活。
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    first_contact = contact_sensor.compute_first_contact(env.step_dt)[:, sensor_cfg.body_ids]
+    last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
+
+    air_time = (last_air_time - threshold_min) * first_contact
+    air_time = torch.clamp(air_time, max=threshold_max - threshold_min)
+    reward = torch.sum(air_time, dim=1)
+
+    cmd = env.command_generator.command
+    has_cmd = torch.norm(cmd[:, :3], dim=1) > 0.1
+    return reward * has_cmd.float()
 
 
 def feet_air_time_exp(
@@ -1209,6 +1748,68 @@ def feet_distance_symmetry_per_cycle_exp(
         + torch.abs(env.command_generator.command[:, 2])
     ) > 0.1
     return reward * has_command.float()
+
+
+def knee_joint_yaw_contact_only(
+    env: BaseEnv | TienKungEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    command_name: str = "base_velocity",
+    joint_names: list[str] | None = None,
+    angular_threshold: float = 0.1,
+    linear_threshold: float = -0.01,
+) -> torch.Tensor:
+    """与 amp_roban_share 等价：只在接触期、直行/后退时惩罚膝关节 yaw 偏离默认位置。
+
+    - 使用脚底 `contact_sensor` 判断是否接触；
+    - 当 |yaw_cmd| 小或 x 方向速度越界（向后）时激活；
+    - 对 `joint_names` 中关节的位置偏离做 L1 惩罚，仅在对应脚接触地面时生效。
+    """
+    # 1. 直行或后退模式
+    cmd = env.command_generator.command
+    lin_vel_x = cmd[:, 0]
+    ang_vel_z = cmd[:, 2]
+    is_valid_mode = (torch.abs(ang_vel_z) < angular_threshold) | (lin_vel_x < linear_threshold)
+
+    # 2. 接触状态（脚部）
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    contacts = (
+        contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+        .norm(dim=-1)
+        .max(dim=1)[0]
+        > 1.0
+    )  # [N, num_feet]
+
+    # 3. 关节偏移
+    asset: Articulation = env.scene[asset_cfg.name]
+    if joint_names is None:
+        joint_names = ["leg_l3_joint", "leg_r3_joint"]
+
+    joint_ids: list[int] = []
+    for name in joint_names:
+        ids, _ = asset.find_joints(name)
+        if len(ids) > 0:
+            joint_ids.append(ids[0])
+
+    if len(joint_ids) == 0:
+        return torch.zeros(env.num_envs, device=asset.data.joint_pos.device)
+
+    current_pos = asset.data.joint_pos[:, joint_ids]
+    default_pos = asset.data.default_joint_pos[:, joint_ids]
+    deviation = torch.abs(current_pos - default_pos)
+
+    # 将关节与脚一一对应（左脚-左膝，右脚-右膝）
+    num_joints = deviation.shape[1]
+    num_feet = contacts.shape[1]
+    if num_joints == num_feet:
+        contact_mask = contacts.float()
+    else:
+        # 若数量不一致，退化为“任一脚接触则所有相关关节惩罚”
+        contact_mask = contacts.any(dim=1, keepdim=True).float().expand_as(deviation)
+
+    penalty = deviation * contact_mask
+    total_penalty = torch.sum(penalty, dim=1)
+    return total_penalty * is_valid_mode.float()
 
 
 def root_height_maintain(

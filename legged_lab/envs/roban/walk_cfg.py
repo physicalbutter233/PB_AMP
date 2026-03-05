@@ -437,12 +437,12 @@ class RobanAmpShareRewardCfg:
     track_lin_vel_xy_exp = RewTerm(
         func=mdp.track_lin_vel_xy_yaw_frame_exp,
         weight=3.5,
-        params={"command_name": "base_velocity", "std": math.sqrt(0.35)},
+        params={"std": math.sqrt(0.35)},
     )
     track_ang_vel_z_exp = RewTerm(
         func=mdp.track_ang_vel_z_world_exp,
         weight=1.55,
-        params={"command_name": "base_velocity", "std": math.sqrt(0.5)},
+        params={"std": math.sqrt(0.5)},
     )
 
     # ---- 步态与接触形状 ----
@@ -489,14 +489,10 @@ class RobanAmpShareRewardCfg:
     )
 
     flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-5.0)
+    # 与 isaaclab 的 term 注册保持一致：不传额外参数，只使用 orientation_l2 的默认配置
     flat_orientation_l2_exp = RewTerm(
         func=mdp.orientation_l2,
         weight=0.5,
-        params={
-            "desired_gravity": (0.05, 0.0, -0.99875),
-            "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
-            "std": 0.0001,
-        },
     )
     dof_pos_limits = RewTerm(func=mdp.joint_pos_limits, weight=-8.0)
     dof_vel_limits = RewTerm(
@@ -529,10 +525,8 @@ class RobanAmpShareRewardCfg:
         func=mdp.contact_forces,
         weight=-0.001,
         params={
-            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
             "threshold": 350.0,
-            "violation_max": 300.0,
-            "violation_min": 0.0,
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
         },
     )
 
@@ -700,10 +694,8 @@ class RobanAmpShareRewardCfg:
         func=mdp.feet_contact_time_symmetry_exp,
         weight=1.6,
         params={
+            "sigma": 0.1,
             "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
-            "command_name": "base_velocity",
-            "degree": 5,
-            "std": 0.1,
         },
     )
     knee_joint_yaw_contact_only = RewTerm(

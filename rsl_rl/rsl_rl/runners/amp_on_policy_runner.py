@@ -455,6 +455,11 @@ class AmpOnPolicyRunner:
         ep_string = ""
         if locs["ep_infos"]:
             for key in locs["ep_infos"][0]:
+                # 只保留课程相关的日志（大幅精简日志量）
+                # - Curriculum/*：地形/外力/速度课程进度
+                # 其他 Episode_Reward/* 或自定义标量不再逐项写入 TensorBoard / 终端
+                if not key.startswith("Curriculum/"):
+                    continue
                 infotensor = torch.tensor([], device=self.device)
                 for ep_info in locs["ep_infos"]:
                     # handle scalar and zero dimensional tensor infos

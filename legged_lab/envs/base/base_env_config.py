@@ -132,7 +132,8 @@ class BaseEnvCfg:
                 func=mdp.randomize_rigid_body_mass,
                 mode="startup",
                 params={
-                    "asset_cfg": SceneEntityCfg("robot", body_names=MISSING),
+                    # 与 base_config.EventCfg 一致：使用 ".*" 匹配所有刚体，避免 MISSING 触发解析错误
+                    "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
                     "mass_distribution_params": (-5.0, 5.0),
                     "operation": "add",
                 },
