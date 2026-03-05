@@ -90,11 +90,10 @@ class AMPLoaderDisplay:
                 frame_duration = float(motion_json["FrameDuration"])
                 self.trajectory_frame_durations.append(frame_duration)
                 traj_len = (motion_data.shape[0] - 1) * frame_duration
-                print(f"traj_len:{traj_len}")
                 self.trajectory_lens.append(traj_len)
                 self.trajectory_num_frames.append(float(motion_data.shape[0]))
 
-            print(f"Loaded {traj_len}s. motion from {motion_file}.")
+            print(f"[Display] Loaded {traj_len:.2f}s motion from {motion_file} (visualization only, not AMP expert).")
 
         # Trajectory weights are used to sample some trajectories more than others.
         self.trajectory_weights = np.array(self.trajectory_weights) / np.sum(self.trajectory_weights)

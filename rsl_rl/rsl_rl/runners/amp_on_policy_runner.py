@@ -547,7 +547,8 @@ class AmpOnPolicyRunner:
             f"elapsed={time.strftime('%H:%M:%S', time.gmtime(self.tot_time))} "
             f"ETA={time.strftime('%H:%M:%S', time.gmtime(eta))}\n"
         )
-        print(log_string, end="")
+        # 白字输出，不使用黄字
+        print(f"\033[37m{log_string}\033[0m", end="")
 
     def save(self, path: str, infos=None):
         # -- Save model

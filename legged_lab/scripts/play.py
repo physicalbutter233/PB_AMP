@@ -220,6 +220,11 @@ def play():
 
         keyboard = Keyboard(env)  # noqa:F841
 
+    # 预热观测历史 buffer：训练时 policy 输入为 actor_obs_history_length 帧拼接，
+    # 首步前只调一次 get_observations() 时 buffer 仅 1 帧、其余为 0，会导致策略乱动/秒倒
+    history_len = getattr(env.cfg.robot, "actor_obs_history_length", 10)
+    for _ in range(history_len - 1):
+        env.get_observations()
     obs, _ = env.get_observations()
 
     while simulation_app.is_running():

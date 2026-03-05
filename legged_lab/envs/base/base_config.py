@@ -208,6 +208,8 @@ class DomainRandCfg:
 @configclass
 class PhysxCfg:
     gpu_max_rigid_patch_count: int = 10 * 2**15
+    # 与 amp_share 一致，避免 collisionStackSize buffer overflow（多 env + 地形接触对过多时必设）
+    gpu_collision_stack_size: int = 2**27
 
 
 @configclass

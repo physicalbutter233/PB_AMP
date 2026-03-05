@@ -65,7 +65,10 @@ class RobanEnv(VecEnv):
             device=cfg.device,
             dt=cfg.sim.dt,
             render_interval=cfg.sim.decimation,
-            physx=PhysxCfg(gpu_max_rigid_patch_count=cfg.sim.physx.gpu_max_rigid_patch_count),
+            physx=PhysxCfg(
+                gpu_max_rigid_patch_count=cfg.sim.physx.gpu_max_rigid_patch_count,
+                gpu_collision_stack_size=getattr(cfg.sim.physx, "gpu_collision_stack_size", 2**27),
+            ),
             physics_material=sim_utils.RigidBodyMaterialCfg(
                 friction_combine_mode="multiply",
                 restitution_combine_mode="multiply",
@@ -769,7 +772,7 @@ class RobanEnv(VecEnv):
         )
         tg = getattr(self.scene.terrain.cfg, "terrain_generator", None) if self.scene.terrain.cfg else None
         terrain_size = tg.size[0] if (tg is not None and getattr(tg, "size", None) is not None) else float("inf")
-        # 地形：amp_share terrain_levels_vel
+        # 地形：amp_share terrain_levels_vel（先按 move_up/move_down 更新，仅用于统计 extras）
         move_up_terrain = (
             (distance > terrain_size / 3)
             & (lin_sum > lin_w * 0.7)
@@ -789,6 +792,13 @@ class RobanEnv(VecEnv):
         self._external_force_torque_level[env_ids[move_down_force]] -= step
         self._external_force_torque_level.clamp_(min=low, max=1.0)
         mean_force = self._external_force_torque_level.float().mean().item()
+        # amp_share 同款顺序：stage_two 在 external_force_torque_levels 之后跑，stage1 时全场地形置 0
+        if self.cfg.scene.terrain_generator is not None and self.cfg.scene.terrain_generator.curriculum:
+            if not self._stage_two_done and self.scene.terrain.terrain_origins is not None:
+                self.scene.terrain.terrain_levels[:] = 0
+                self.scene.terrain.env_origins[:] = self.scene.terrain.terrain_origins[
+                    0, self.scene.terrain.terrain_types, :
+                ]
         # stage two：mean(force_level) >= 0.9 时一次性重写权重（amp_share 同款）
         if (
             not self._stage_two_done
@@ -801,7 +811,13 @@ class RobanEnv(VecEnv):
                     idx = reward._term_names.index(name)
                     reward._term_cfgs[idx].weight = float(w)
             self._external_force_torque_level[:] = low
-            print("[TerrainForceCurriculum] Stage two 已触发，奖励权重已重写，外力水平已重置。")
+            # 进入 stage2 瞬间场地难度归 0：地形等级全置 0 并同步 env_origins
+            if self.cfg.scene.terrain_generator is not None and self.scene.terrain.terrain_origins is not None:
+                self.scene.terrain.terrain_levels[:] = 0
+                self.scene.terrain.env_origins[:] = self.scene.terrain.terrain_origins[
+                    0, self.scene.terrain.terrain_types, :
+                ]
+            print("[TerrainForceCurriculum] Stage two 已触发，奖励权重已重写，外力水平已重置，场地难度已归 0。")
         # 调试：每次 reset 时满足升级/降级的 env 数量，便于确认「不动」是条件未满足还是逻辑未执行
         n_reset = len(env_ids)
         extras = {

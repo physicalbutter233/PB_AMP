@@ -191,7 +191,7 @@ class AMPLoader:
                 traj_len = (num_frames - 1) * dt
                 self.trajectory_lens.append(traj_len)
                 self.trajectory_num_frames.append(float(num_frames))
-                print(f"Loaded {traj_len:.2f}s motion from {motion_file} (npz, weight={w:.3f}).")
+                print(f"[AMP expert] Loaded {traj_len:.2f}s motion from {motion_file} (npz, weight={w:.3f}).")
             else:
                 with open(motion_file) as f:
                     motion_json = json.load(f)
@@ -223,11 +223,16 @@ class AMPLoader:
                     traj_len = (motion_data.shape[0] - 1) * frame_duration
                     self.trajectory_lens.append(traj_len)
                     self.trajectory_num_frames.append(float(motion_data.shape[0]))
-                    print(f"Loaded {traj_len:.2f}s motion from {motion_file} (weight={w:.3f}).")
+                    print(f"[AMP expert] Loaded {traj_len:.2f}s motion from {motion_file} (weight={w:.3f}).")
 
         # Trajectory weights are used to sample some trajectories more than others.
         self.trajectory_weights = np.array(self.trajectory_weights, dtype=np.float64)
         self.trajectory_weights = self.trajectory_weights / np.sum(self.trajectory_weights)
+        n_traj = len(self.trajectory_idxs)
+        if n_traj > 1:
+            print(f"[AMP expert] Total {n_traj} trajectories loaded for discriminator (multi-trajectory AMP).")
+        else:
+            print(f"[AMP expert] Total 1 trajectory loaded for discriminator (fallback single motion).")
         self.trajectory_frame_durations = np.array(self.trajectory_frame_durations)
         self.trajectory_lens = np.array(self.trajectory_lens)
         self.trajectory_num_frames = np.array(self.trajectory_num_frames)

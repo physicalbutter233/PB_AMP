@@ -27,7 +27,7 @@ from isaaclab_rl.rsl_rl import (  # noqa:F401
 )
 
 import legged_lab.mdp as mdp
-from legged_lab.assets.roban_s14 import ROBAN_S14_CFG
+from legged_lab.assets.roban_s2 import ROBAN_S2_CFG
 from legged_lab.envs.base.base_config import (
     ActionDelayCfg,
     BaseSceneCfg,
@@ -63,6 +63,9 @@ def get_amp_motion_files_multi_trajectory():
     MOTIONS_DIR = _get_amp_share_motions_dir()
     scaled_dir = os.path.join(MOTIONS_DIR, "scaled_shoulder_only")
     if not os.path.isdir(scaled_dir):
+        print(
+            f"[AMP] Multi-trajectory dir not found: {scaled_dir} — using single-trajectory fallback."
+        )
         return ["legged_lab/envs/roban/datasets/motion_amp_expert/walk_pb_add_root.txt"]
     return {
         os.path.join(MOTIONS_DIR, "scaled_shoulder_only", "直行_中速_小摆手_003_Skeleton.npz"): 1.5,
@@ -109,7 +112,7 @@ class TerrainForceCurriculumCfg:
     def __post_init__(self):
         if self.stage_2_reward_weights is None:
             self.stage_2_reward_weights = {
-                # 完全对齐 amp_share 中 RobanS2MixEnvCfg.CurriculumCfg.stage_two 的 stage_2_reward_weight
+                # 完全对齐 amp_share velocity_amp CurriculumCfg.stage_two 的 stage_2_reward_weight
                 "track_lin_vel_xy_exp": 4.5,
                 "track_ang_vel_z_exp": 2.25,
                 "ang_vel_xy_l2": -4.0,
@@ -117,6 +120,7 @@ class TerrainForceCurriculumCfg:
                 "dof_acc_l2": -1e-5,
                 "action_rate_l2": -0.01,
                 "action_smoothness_l2": -0.04,
+                "joint_deviation_knee_yaw": 0.0,
                 "fft_dof_symmetry": 0.01,
                 "action_rate_l2_ankle_roll": -0.5,
                 "joint_deviation_ankle_roll": -0.5,
@@ -730,7 +734,7 @@ class RobanWalkFlatEnvCfg:
         max_episode_length_s=20.0,
         num_envs=4096,
         env_spacing=2.5,
-        robot=ROBAN_S14_CFG,
+        robot=ROBAN_S2_CFG,
         terrain_type="generator",
         terrain_generator=ROUGH_TERRAINS_CFG,
         max_init_terrain_level=0,
@@ -800,6 +804,8 @@ class RobanWalkFlatEnvCfg:
             height_scan=0.1,
         ),
     )
+    # 域随机：完全对齐 amp_share velocity_amp EventCfg（ext_roban/.../velocity_amp_env_cfg.py）
+    # 显式关闭 amp_share 中不存在的项：add_base_mass、push_robot（PB_AMP base 默认有）
     domain_rand: DomainRandCfg = DomainRandCfg(
         events=EventCfg(
             physics_material=EventTerm(
@@ -807,21 +813,19 @@ class RobanWalkFlatEnvCfg:
                 mode="startup",
                 params={
                     "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-                    # 对齐 amp_share：更宽的摩擦 / 恢复系数范围
                     "static_friction_range": (0.3, 1.0),
                     "dynamic_friction_range": (0.2, 1.0),
                     "restitution_range": (0.0, 0.5),
                     "num_buckets": 64,
+                    "make_consistent": True,
                 },
             ),
-            # 对齐 amp_share：腿/臂 link 质量缩放，而不是只给 base_link 加质量
+            add_base_mass=None,
             scale_link_mass=EventTerm(
                 func=mdp.randomize_rigid_body_mass,
                 mode="startup",
                 params={
-                    "asset_cfg": SceneEntityCfg(
-                        "robot", body_names=["leg_.*_link", "zarm_.*_link"]
-                    ),
+                    "asset_cfg": SceneEntityCfg("robot", body_names=["leg_.*_link", "zarm_.*_link"]),
                     "mass_distribution_params": (0.8, 1.2),
                     "operation": "scale",
                 },
@@ -858,14 +862,7 @@ class RobanWalkFlatEnvCfg:
                 func=mdp.reset_root_state_uniform,
                 mode="reset",
                 params={
-                    # 对齐 amp_share：位置范围略大，增加 pitch/roll 随机
-                    "pose_range": {
-                        "x": (-0.7, 0.7),
-                        "y": (-0.7, 0.7),
-                        "yaw": (-3.14, 3.14),
-                        "pitch": (-0.1, 0.1),
-                        "roll": (-0.1, 0.1),
-                    },
+                    "pose_range": {"x": (-0.7, 0.7), "y": (-0.7, 0.7), "yaw": (-3.14, 3.14), "pitch": (-0.1, 0.1), "roll": (-0.1, 0.1)},
                     "velocity_range": {
                         "x": (-0.3, 0.3),
                         "y": (-0.3, 0.3),
@@ -884,30 +881,27 @@ class RobanWalkFlatEnvCfg:
                     "velocity_range": (0.0, 0.0),
                 },
             ),
-            # Interval 外力事件：完全对齐 amp_share EventCfg.base_external_force_torque
             base_external_force_torque=EventTerm(
                 func=mdp.apply_external_force_torque_stochastic,
                 mode="interval",
                 interval_range_s=(0.01, 0.3),
                 params={
                     "asset_cfg": SceneEntityCfg("robot", body_names="base_link"),
-                    "force_range": {
-                        "x": (-100.0, 100.0),
-                        "y": (-100.0, 100.0),
-                        "z": (-100.0, 100.0),
-                    },
-                    "torque_range": {
-                        "x": (-50.0, 50.0),
-                        "y": (-50.0, 50.0),
-                        "z": (-50.0, 50.0),
-                    },
+                    "force_range": {"x": (-100.0, 100.0), "y": (-100.0, 100.0), "z": (-100.0, 100.0)},
+                    "torque_range": {"x": (-50.0, 50.0), "y": (-50.0, 50.0), "z": (-50.0, 50.0)},
                     "probability": 0.01,
                 },
             ),
+            push_robot=None,
         ),
         action_delay=ActionDelayCfg(enable=False, params={"max_delay": 5, "min_delay": 0}),
     )
-    sim: SimCfg = SimCfg(dt=0.005, decimation=4, physx=PhysxCfg(gpu_max_rigid_patch_count=10 * 2**15))
+    # 与 amp_share 一致：gpu_collision_stack_size=2**27 避免 PhysX collision stack overflow
+    sim: SimCfg = SimCfg(
+        dt=0.005,
+        decimation=4,
+        physx=PhysxCfg(gpu_max_rigid_patch_count=10 * 2**15, gpu_collision_stack_size=2**27),
+    )
 
 
 @configclass
