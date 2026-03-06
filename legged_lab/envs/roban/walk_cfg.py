@@ -364,15 +364,15 @@ class RobanLiteRewardCfg(LiteRewardCfg):
         weight=0.5,  # moderate: single support > double penalty
         params={"threshold": 10.0, "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"])},
     )
+    # 使用 amp_share 的步态高度鼓励形式（feet_height_cycle），
+    # 但高度上限参考原本的单腿抬高奖励：max_height≈0.12，而不是 amp_share 的 0.15。
     humanoid_swing_foot_height = RewTerm(
-        func=mdp.humanoid_swing_foot_height_reward,
-        weight=3.5,  # moderate, does not dominate velocity tracking
+        func=mdp.feet_height_cycle,
+        weight=3.5,
         params={
-            "threshold": 10.0,
-            "height_threshold": 0.05,
-            "max_height": 0.12,
             "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
             "asset_cfg": SceneEntityCfg("robot", body_names=["leg_l6_link", "leg_r6_link"]),
+            "max_height_clip": 0.12,
         },
     )
     humanoid_swing_foot_forward = RewTerm(
