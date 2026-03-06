@@ -1559,11 +1559,11 @@ def humanoid_swing_foot_forward_reward(
     in_contact = torch.norm(net_forces, dim=-1) > threshold  # [batch, 2]
     num_contacts = torch.sum(in_contact.int(), dim=1)
     single_support = num_contacts == 1
-    has_command = (
-        torch.norm(env.command_generator.command[:, :2], dim=1)
-        + torch.abs(env.command_generator.command[:, 2])
-    ) > 0.1
 
+    # 仅在前行/后退有指令时激活；侧移或纯转向不使用“向前”奖励。
+    cmd = env.command_generator.command
+    cmd_forward = cmd[:, 0]
+    has_forward_cmd = torch.abs(cmd_forward) > 0.1
     root_pos = asset.data.root_pos_w[:, :3]
     root_quat = asset.data.root_quat_w
     yaw_quat = math_utils.yaw_quat(root_quat)
@@ -1573,11 +1573,16 @@ def humanoid_swing_foot_forward_reward(
     feet_pos = asset.data.body_pos_w[:, asset_cfg.body_ids, :]  # [batch, 2, 3]
     rel_pos = feet_pos - root_pos.unsqueeze(1)  # [batch, 2, 3]
     forward_disp = torch.sum(rel_pos * forward_w.unsqueeze(1), dim=-1)  # [batch, 2]
-    forward_disp = forward_disp.clamp(min=0.0)  # only reward positive (ahead)
 
-    swing_forward = torch.where(in_contact, torch.zeros_like(forward_disp), forward_disp)
+    # 根据指令方向自适应：向前走奖励“向前”，向后走奖励“向后”。
+    # sign(cmd_forward)=+1 → 前进，-1 → 后退；将位移乘以该符号后再截断为正值。
+    sign_forward = torch.sign(cmd_forward).clamp(min=-1.0, max=1.0).unsqueeze(1)  # [batch,1]
+    signed_disp = forward_disp * sign_forward
+    signed_disp = signed_disp.clamp(min=0.0)
+
+    swing_forward = torch.where(in_contact, torch.zeros_like(signed_disp), signed_disp)
     reward = torch.sum(swing_forward, dim=1)
-    return reward * single_support.float() * has_command.float()
+    return reward * single_support.float() * has_forward_cmd.float()
 
 
 def humanoid_swing_foot_lateral_penalty(
@@ -1738,16 +1743,32 @@ def feet_distance_symmetry_per_cycle_exp(
     """
     if not hasattr(env, "_last_cycle_foot_distance"):
         return torch.zeros(env.num_envs, device=env.device)
+
     dist = env._last_cycle_foot_distance
     diff = dist[:, 0] - dist[:, 1]
     reward = torch.exp(-torch.square(diff) / (sigma**2))
     valid = (dist[:, 0] >= min_stride) & (dist[:, 1] >= min_stride)
     reward = reward * valid.float()
-    has_command = (
-        torch.norm(env.command_generator.command[:, :2], dim=1)
-        + torch.abs(env.command_generator.command[:, 2])
-    ) > 0.1
-    return reward * has_command.float()
+
+    # 根据指令类型对奖励进行门控：
+    # - 直行/后退：全额激活；
+    # - 纯侧移：减半激活（左右步幅可以略不对称）；
+    # - 原地转圈：关闭（由旋转类奖励负责）。
+    cmd = env.command_generator.command
+    lin_x = cmd[:, 0]
+    lin_y = cmd[:, 1]
+    ang_z = cmd[:, 2]
+
+    forward_or_backward = torch.abs(lin_x) > 0.1
+    side_only = (torch.abs(lin_y) > 0.1) & (torch.abs(lin_x) <= 0.1) & (torch.abs(ang_z) <= 0.1)
+    turning_only = (torch.abs(ang_z) > 0.1) & (torch.norm(cmd[:, :2], dim=1) <= 0.1)
+
+    factor = torch.zeros_like(lin_x)
+    factor = torch.where(forward_or_backward, torch.ones_like(factor), factor)
+    factor = torch.where(side_only, 0.5 * torch.ones_like(factor), factor)
+    factor = torch.where(turning_only, torch.zeros_like(factor), factor)
+
+    return reward * factor
 
 
 def knee_joint_yaw_contact_only(

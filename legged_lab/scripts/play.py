@@ -77,8 +77,8 @@ def play():
     env_cfg.scene.num_envs = 50
     env_cfg.scene.env_spacing = 2.5
     env_cfg.commands.rel_standing_envs = 0.0
-    env_cfg.commands.ranges.lin_vel_x = (1.0, 1.0)
-    env_cfg.commands.ranges.lin_vel_y = (0.0, 0.0)
+    env_cfg.commands.ranges.lin_vel_x = (0.0, 0.0)
+    env_cfg.commands.ranges.lin_vel_y = (1.0, 1.0)
     env_cfg.commands.ranges.ang_vel_z = (0.0, 0.0)  # 禁止旋转，只向前走
     # 禁用速度课程：否则 _apply_velocity_level(0) 会覆盖上面的 ranges
     if hasattr(env_cfg, "velocity_curriculum") and env_cfg.velocity_curriculum is not None:
@@ -227,13 +227,23 @@ def play():
         env.get_observations()
     obs, _ = env.get_observations()
 
-    while simulation_app.is_running():
-
-        with torch.inference_mode():
-            actions = policy(obs)
-            obs, _, _, _ = env.step(actions)
+    try:
+        while simulation_app.is_running():
+            with torch.inference_mode():
+                actions = policy(obs)
+                obs, _, _, _ = env.step(actions)
+    finally:
+        # 在关闭 Omniverse 前显式释放环境和 runner，避免 SimStage/plugin 未释放导致的退出警告
+        if "runner" in dir() and runner is not None:
+            del runner
+        if "env" in dir() and env is not None:
+            if hasattr(env, "clear"):
+                env.clear()
+            del env
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        simulation_app.close()
 
 
 if __name__ == "__main__":
     play()
-    simulation_app.close()
