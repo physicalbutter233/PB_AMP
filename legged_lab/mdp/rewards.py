@@ -100,6 +100,12 @@ def energy(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCf
     return reward
 
 
+def joint_torques_l2(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """关节力矩 L2 惩罚：对指定关节的 applied_torque 平方和，需配合负权重使用。"""
+    asset: Articulation = env.scene[asset_cfg.name]
+    return torch.sum(torch.square(asset.data.applied_torque[:, asset_cfg.joint_ids]), dim=1)
+
+
 def joint_acc_l2(env: BaseEnv | TienKungEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
     return torch.sum(torch.square(asset.data.joint_acc[:, asset_cfg.joint_ids]), dim=1)
@@ -548,6 +554,17 @@ def body_force(
     reward[reward > threshold] -= threshold
     reward = reward.clamp(min=0, max=max_reward)
     return reward
+
+
+def contact_forces(
+    env: BaseEnv | TienKungEnv, sensor_cfg: SceneEntityCfg, threshold: float = 350.0
+) -> torch.Tensor:
+    """与 amp_share 一致：足底接触力范数超过 threshold 时对超出部分施加惩罚（配合负权重）。"""
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    net_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
+    force_norm = torch.norm(net_forces, dim=-1)
+    excess = torch.clamp(force_norm - threshold, min=0.0)
+    return excess.sum(dim=1)
 
 
 def gravity_aligned_when_stopping(
@@ -1163,6 +1180,25 @@ def contact_momentum(
         + torch.abs(env.command_generator.command[:, 2])
     ) > 0.1
     return reward_sum * has_command.float()
+
+
+def excessive_landing_force_penalty(
+    env: BaseEnv,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float = 200.0,
+) -> torch.Tensor:
+    """惩罚落地瞬间过大的接触力（落地冲击）。
+
+    仅在脚刚着地（first_contact）的那一帧，若该脚接触力范数超过 threshold，则对超出部分施加惩罚；
+    鼓励轻落地、减少冲击。
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    first_contact = contact_sensor.compute_first_contact(env.step_dt)[:, sensor_cfg.body_ids]  # [N, feet]
+    net_forces = contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]  # [N, feet, 3]
+    force_norm = torch.norm(net_forces, dim=-1)  # [N, feet]
+    excess = torch.clamp(force_norm - threshold, min=0.0)
+    penalty = (excess * first_contact.float()).sum(dim=1)
+    return penalty
 
 
 # ══════════════════════════════════════════════════════════════════════════════

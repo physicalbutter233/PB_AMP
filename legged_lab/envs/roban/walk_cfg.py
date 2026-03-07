@@ -304,9 +304,21 @@ class LiteRewardCfg:
 
 @configclass
 class RobanLiteRewardCfg(LiteRewardCfg):
-    """Pragmatic Minimalist Core with Roban S14 body/joint names."""
+    """Pragmatic Minimalist Core with Roban S14 body/joint names. 配置参考 amp_share (RobanAmpShareRewardCfg)。"""
 
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
+
+    # 速度跟踪（与 amp_share 权重/std 一致）
+    track_lin_vel_xy_exp = RewTerm(
+        func=mdp.track_lin_vel_xy_yaw_frame_exp,
+        weight=3.5,
+        params={"std": math.sqrt(0.35)},
+    )
+    track_ang_vel_z_exp = RewTerm(
+        func=mdp.track_ang_vel_z_world_exp,
+        weight=1.55,
+        params={"std": math.sqrt(0.5)},
+    )
 
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
@@ -364,20 +376,20 @@ class RobanLiteRewardCfg(LiteRewardCfg):
         weight=0.5,  # moderate: single support > double penalty
         params={"threshold": 10.0, "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"])},
     )
-    # 使用 amp_share 的步态高度鼓励形式（feet_height_cycle），
-    # 但高度上限参考原本的单腿抬高奖励：max_height≈0.12，而不是 amp_share 的 0.15。
+    # 与 amp_share feet_height_cycle 一致：weight=12.0, max_height_clip=0.15
     humanoid_swing_foot_height = RewTerm(
         func=mdp.feet_height_cycle,
-        weight=3.5,
+        weight=12.0,
         params={
-            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
-            "asset_cfg": SceneEntityCfg("robot", body_names=["leg_l6_link", "leg_r6_link"]),
-            "max_height_clip": 0.12,
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
+            "asset_cfg": SceneEntityCfg("robot", body_names="leg_[l,r]6_link"),
+            "max_height_clip": 0.15,
         },
     )
+    # 暂时屏蔽：amp_share 无此项；恢复时改回 weight=2.0
     humanoid_swing_foot_forward = RewTerm(
         func=mdp.humanoid_swing_foot_forward_reward,
-        weight=5.0,  # 单支撑时奖励摆动脚向前（左脚支撑奖右脚向前，反之亦然）
+        weight=0.0,
         params={
             "threshold": 10.0,
             "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
@@ -411,9 +423,34 @@ class RobanLiteRewardCfg(LiteRewardCfg):
         func=mdp.contact_ground_straight_knee,
         weight=1.0,
         params={
-            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
             "asset_cfg": SceneEntityCfg("robot", joint_names=["leg_[l,r]4_joint"]),
             "std": 0.3,
+        },
+    )
+    # 与 amp_share 一致的接触/力项：轻落地奖励、足底接触力上限惩罚
+    contact_momentum = RewTerm(
+        func=mdp.contact_momentum,
+        weight=0.25,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
+        },
+    )
+    contact_force = RewTerm(
+        func=mdp.contact_forces,
+        weight=-0.001,
+        params={
+            "threshold": 350.0,
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
+        },
+    )
+    # 落地瞬间过大接触力惩罚：仅在 first_contact 时对超过 threshold 的力施加惩罚，鼓励轻落地
+    excessive_landing_force_penalty = RewTerm(
+        func=mdp.excessive_landing_force_penalty,
+        weight=-0.002,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
+            "threshold": 200.0,
         },
     )
 
@@ -463,6 +500,50 @@ class RobanLiteRewardCfg(LiteRewardCfg):
             "std": 0.02,
         },
     )
+    # 小指令/零指令下站定：站直、收关节、静止（与 RobanAmpShareRewardCfg 对齐）
+    gravity_aligned_when_stopping = RewTerm(
+        func=mdp.gravity_aligned_when_stopping,
+        weight=0.5,
+        params={
+            "command_name": "base_velocity",
+            "std": 0.05,
+        },
+    )
+    stand_still_without_cmd = RewTerm(
+        func=mdp.stand_still_without_cmd,
+        weight=-0.3,
+        params={"command_name": "base_velocity"},
+    )
+    stand_static_vel_without_cmd = RewTerm(
+        func=mdp.stand_static_vel_without_cmd,
+        weight=-0.1,
+        params={
+            "command_name": "base_velocity",
+            "asset_cfg": SceneEntityCfg("robot"),
+            "cmd_threshold": 0.05,
+            "ext_force_threshold": 10.0,
+        },
+    )
+    # 关节功率 L2、关节力矩 L2、关节加速度 L2、动作序列平滑（与 amp_share 一致）
+    dof_power_l2 = RewTerm(
+        func=mdp.joint_power_l2,
+        weight=-2.0e-5,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+    dof_torques_l2 = RewTerm(
+        func=mdp.joint_torques_l2,
+        weight=-4.0e-6,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=["leg_[l,r][1-5]_joint", "zarm_.*_joint"]),
+        },
+    )
+    dof_acc_l2 = RewTerm(
+        func=mdp.joint_mean_acc_l2,
+        weight=-6e-6,
+        params={"asset_cfg": SceneEntityCfg("robot")},
+    )
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+    action_smoothness_l2 = RewTerm(func=mdp.action_smoothness_l2, weight=-0.01)
 
     # 转弯步频：防止转弯时长时间双脚同时着地（步频太慢）
     turning_step_frequency = RewTerm(
@@ -506,6 +587,11 @@ class RobanLiteRewardCfg(LiteRewardCfg):
     # feet_height, straight_knee_landing, soft_landing, root_height_maintain
 
     # ─── 前行指令与奖励门控说明（RobanLiteRewardCfg）───
+    # 【小指令/零指令下站定】仅当 norm(cmd[:,:2]) 与 |cmd_yaw| 较小时生效，鼓励站直、收关节、静止：
+    #   - gravity_aligned_when_stopping：零线速度指令时奖励躯干与重力对齐（站直）
+    #   - stand_still_without_cmd：无指令时惩罚关节相对默认位姿的偏移
+    #   - stand_static_vel_without_cmd：无指令且外力小时惩罚关节速度
+    #   - feet_parallel_when_standing：站立时奖励双脚 x 方向对齐
     # 【目前只对前行/线速度有效的项】门控仅用 norm(cmd[:,:2]) 或仅在 |cmd_y| 较小时生效：
     #   - feet_contact_time_symmetry：has_command = norm(cmd[:,:2]) > 0.1（未含 ang_vel，转圈时不激活）
     #   - feet_y_distance：仅在 |cmd_y| < 0.1 时施加惩罚，等价于主要对前行/小侧移有效
