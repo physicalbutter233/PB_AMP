@@ -66,7 +66,7 @@ class RobotCfg:
     action_scale: float = 0.25
     terminate_contacts_body_names: list = []
     feet_body_names: list = []
-    include_gait_in_obs: bool = True  # 是否在观察值中包含步态信息
+    include_gait_in_obs: bool = False  # 是否在观察值中包含步态信息；False=72维与部署/amp_share一致
     terminate_min_height: float = 0.0  # 根部高度低于此值时终止（0 表示不启用）
 
 

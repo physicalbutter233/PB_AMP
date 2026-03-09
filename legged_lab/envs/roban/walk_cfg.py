@@ -97,6 +97,65 @@ class GaitCfg:
     gait_cycle: float = 1.0
 
 
+# =============================================================================
+# 对称性配置打包：便于查找与切换，统一管理奖励权重与镜像损失系数
+# =============================================================================
+
+@configclass
+class SymmetryPresetCfg:
+    """对称性相关参数打包。切换 SYMMETRY_PRESET 即可在强/弱对称间切换。"""
+
+    # ----- 基权重（RobanLiteRewardCfg 中三个对称项）-----
+    feet_contact_time_symmetry_weight: float = 1.0
+    feet_distance_symmetry_per_cycle_weight: float = 1.0
+    fft_dof_symmetry_weight: float = 0.001
+
+    # ----- 速度课程各级对称项乘数（VelocityCurriculumCfg.reward_multipliers）-----
+    vel_symmetry_mult_l0: float = 1.0
+    vel_symmetry_mult_l1: float = 1.0
+    vel_symmetry_mult_l2: float = 1.2
+
+    # ----- 外力课程 stage_2 时 fft_dof_symmetry 覆盖值（TerrainForceCurriculumCfg）-----
+    stage_2_fft_dof_symmetry: float = 0.01
+
+    # ----- PPO/AMP 镜像损失（symmetry_cfg + runner 传入 algorithm）-----
+    mirror_loss_coeff: float = 3.0
+    critic_mirror_loss_coeff: float = 3
+    disc_mirror_loss_coeff: float = 3
+
+
+# 强对称：当前在用的加强版（基权重大、课程乘数高、镜像损失强）
+SYMMETRY_STRONG = SymmetryPresetCfg(
+    feet_contact_time_symmetry_weight=1.5,
+    feet_distance_symmetry_per_cycle_weight=1.5,
+    fft_dof_symmetry_weight=0.002,
+    vel_symmetry_mult_l0=1.3,
+    vel_symmetry_mult_l1=1.3,
+    vel_symmetry_mult_l2=1.6,
+    stage_2_fft_dof_symmetry=0.02,
+    mirror_loss_coeff=4.0,
+    critic_mirror_loss_coeff=4,
+    disc_mirror_loss_coeff=4,
+)
+
+# 弱对称：先前相对温和的一套（与 amp_share 默认更接近）
+SYMMETRY_WEAK = SymmetryPresetCfg(
+    feet_contact_time_symmetry_weight=1.0,
+    feet_distance_symmetry_per_cycle_weight=1.0,
+    fft_dof_symmetry_weight=0.001,
+    vel_symmetry_mult_l0=1.0,
+    vel_symmetry_mult_l1=1.0,
+    vel_symmetry_mult_l2=1.2,
+    stage_2_fft_dof_symmetry=0.01,
+    mirror_loss_coeff=3.0,
+    critic_mirror_loss_coeff=3,
+    disc_mirror_loss_coeff=3,
+)
+
+# 当前使用的对称性预设（改此处即可切换强/弱对称）
+SYMMETRY_PRESET = SYMMETRY_STRONG  # 切换为 SYMMETRY_WEAK 即使用弱对称
+
+
 @configclass
 class TerrainForceCurriculumCfg:
     """与 amp_share 一致：地形课程 + 推力课程，切换条件为外力水平 >= stage_two_force_threshold 时应用 stage_2 权重。"""
@@ -112,16 +171,15 @@ class TerrainForceCurriculumCfg:
     def __post_init__(self):
         if self.stage_2_reward_weights is None:
             self.stage_2_reward_weights = {
-                # 完全对齐 amp_share velocity_amp CurriculumCfg.stage_two 的 stage_2_reward_weight
                 "track_lin_vel_xy_exp": 4.5,
                 "track_ang_vel_z_exp": 2.25,
                 "ang_vel_xy_l2": -4.0,
                 "ang_acc_xy_l2": -0.0001,
                 "dof_acc_l2": -1e-5,
-                "action_rate_l2": -0.01,
-                "action_smoothness_l2": -0.04,
+                "action_rate_l2": -0.02,
+                "action_smoothness_l2": -0.05,
                 "joint_deviation_knee_yaw": 0.0,
-                "fft_dof_symmetry": 0.01,
+                "fft_dof_symmetry": SYMMETRY_PRESET.stage_2_fft_dof_symmetry,
                 "action_rate_l2_ankle_roll": -0.5,
                 "joint_deviation_ankle_roll": -0.5,
                 "stand_still_without_cmd": -1.0,
@@ -200,37 +258,37 @@ class VelocityCurriculumCfg:
 
         if self.reward_multipliers is None:
             self.reward_multipliers = [
-                # Level 0 (Ignition): 聚焦前进与身体水平
+                # Level 0 (Ignition): 聚焦前进与身体水平；对称乘数来自 SYMMETRY_PRESET
                 {
                     "track_lin_vel_xy_exp": 1.5,
-                    "flat_orientation_exp": 1.0,
-                    "base_height_penalty": 1.0,
-                    "humanoid_single_support_reward": 1.0,
-                    "humanoid_swing_foot_height": 1.0,
-                    "feet_contact_time_symmetry": 1.0,
-                    "feet_distance_symmetry_per_cycle": 1.0,
-                    "feet_distance": 1.0,
+                    "flat_orientation_exp": 1.3,
+                    "base_height_penalty": 1.2,
+                    "humanoid_single_support_reward": 1.3,
+                    "humanoid_swing_foot_height": 1.2,
+                    "feet_contact_time_symmetry": SYMMETRY_PRESET.vel_symmetry_mult_l0,
+                    "feet_distance_symmetry_per_cycle": SYMMETRY_PRESET.vel_symmetry_mult_l0,
                 },
                 # Level 1 (Steering): 聚焦转向精度
                 {
                     "track_lin_vel_xy_exp": 1.0,
                     "track_ang_vel_z_exp": 1.5,
-                    "flat_orientation_exp": 1.0,
-                    "base_height_penalty": 1.0,
-                    "humanoid_single_support_reward": 1.0,
-                    "humanoid_swing_foot_height": 1.0,
-                    "feet_contact_time_symmetry": 1.0,
-                    "feet_distance_symmetry_per_cycle": 1.0,
+                    "flat_orientation_exp": 1.3,
+                    "base_height_penalty": 1.2,
+                    "humanoid_single_support_reward": 1.3,
+                    "humanoid_swing_foot_height": 1.2,
+                    "feet_contact_time_symmetry": SYMMETRY_PRESET.vel_symmetry_mult_l1,
+                    "feet_distance_symmetry_per_cycle": SYMMETRY_PRESET.vel_symmetry_mult_l1,
                 },
-                # Level 2 (Omni & Refinement): 对齐 amp_share stage_two 权重逻辑
-                # 进入全指令范围后加强跟踪与平滑/对称，对应 stage_2_reward_weight
+                # Level 2 (Omni & Refinement): 加强跟踪、平滑与对称
                 {
-                    "track_lin_vel_xy_exp": 2.25,   # amp_share stage_two: 4.5 (≈ base 2.0 * 2.25)
-                    "track_ang_vel_z_exp": 1.5,     # amp_share: 2.25 (≈ base 1.5 * 1.5)
-                    "action_rate_l2": 2.0,          # 加强动作平滑惩罚 (amp: -0.01)
-                    "dof_acc_l2": 4.0,              # 加强关节加速度惩罚 (amp: -1e-5)
-                    "feet_contact_time_symmetry": 1.2,
-                    "feet_distance_symmetry_per_cycle": 1.2,
+                    "track_lin_vel_xy_exp": 2.25,
+                    "track_ang_vel_z_exp": 1.5,
+                    "action_rate_l2": 2.5,
+                    "dof_acc_l2": 4.0,
+                    "flat_orientation_exp": 1.2,
+                    "base_height_penalty": 1.2,
+                    "feet_contact_time_symmetry": SYMMETRY_PRESET.vel_symmetry_mult_l2,
+                    "feet_distance_symmetry_per_cycle": SYMMETRY_PRESET.vel_symmetry_mult_l2,
                 },
             ]
 
@@ -319,6 +377,15 @@ class RobanLiteRewardCfg(LiteRewardCfg):
         weight=1.55,
         params={"std": math.sqrt(0.5)},
     )
+    # 结构性：躯干水平与基高（覆盖 LiteRewardCfg 默认，加大权重）
+    flat_orientation_exp = RewTerm(
+        func=mdp.flat_orientation_exp, weight=1.5, params={"std": 0.25}
+    )
+    base_height_penalty = RewTerm(
+        func=mdp.base_height_penalty,
+        weight=-1.5,
+        params={"min_height": 0.6},
+    )
 
     undesired_contacts = RewTerm(
         func=mdp.undesired_contacts,
@@ -353,10 +420,10 @@ class RobanLiteRewardCfg(LiteRewardCfg):
         params={"asset_cfg": SceneEntityCfg("robot", body_names=["leg_l6_link", "leg_r6_link"])},
     )
 
-    # 放宽双脚 3D 距离限制（原 0.22~0.30，现 0.18~0.36）
+    # 双脚 3D 距离奖励已取消（weight=0），不再约束两脚间距
     feet_distance = RewTerm(
         func=mdp.feet_distance_penalty,
-        weight=-0.2,
+        weight=0.0,
         params={
             "min_dist": 0.18,
             "max_dist": 0.36,
@@ -373,13 +440,13 @@ class RobanLiteRewardCfg(LiteRewardCfg):
     )
     humanoid_single_support_reward = RewTerm(
         func=mdp.humanoid_single_support_reward,
-        weight=0.5,  # moderate: single support > double penalty
+        weight=0.8,  # 加强单支撑奖励，促进步态结构
         params={"threshold": 10.0, "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"])},
     )
-    # 与 amp_share feet_height_cycle 一致：weight=12.0, max_height_clip=0.15
+    # 摆腿高度：加强步态结构性
     humanoid_swing_foot_height = RewTerm(
         func=mdp.feet_height_cycle,
-        weight=12.0,
+        weight=14.0,
         params={
             "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
             "asset_cfg": SceneEntityCfg("robot", body_names="leg_[l,r]6_link"),
@@ -418,10 +485,10 @@ class RobanLiteRewardCfg(LiteRewardCfg):
             "threshold_max": 0.45,
         },
     )
-    # 接触时膝盖保持较直（着地瞬间奖励伸直膝），与 amp_share contact_ground_straight_knee 一致
+    # 接触时膝盖保持较直（着地瞬间奖励伸直膝），加强结构性
     contact_ground_straight_knee = RewTerm(
         func=mdp.contact_ground_straight_knee,
-        weight=1.0,
+        weight=1.5,
         params={
             "sensor_cfg": SceneEntityCfg("contact_sensor", body_names="leg_[l,r]6_link"),
             "asset_cfg": SceneEntityCfg("robot", joint_names=["leg_[l,r]4_joint"]),
@@ -454,26 +521,23 @@ class RobanLiteRewardCfg(LiteRewardCfg):
         },
     )
 
+    # 对称性权重来自 SYMMETRY_PRESET（强/弱对称切换见文件顶部）
     feet_contact_time_symmetry = RewTerm(
         func=mdp.feet_contact_time_symmetry_exp,
-        weight=1.0,
+        weight=SYMMETRY_PRESET.feet_contact_time_symmetry_weight,
         params={
             "sigma": 0.25,
             "sensor_cfg": SceneEntityCfg("contact_sensor", body_names=["leg_l6_link", "leg_r6_link"]),
         },
     )
-    # 一个步态周期内两脚移动距离相近
     feet_distance_symmetry_per_cycle = RewTerm(
         func=mdp.feet_distance_symmetry_per_cycle_exp,
-        weight=1.0,
+        weight=SYMMETRY_PRESET.feet_distance_symmetry_per_cycle_weight,
         params={"sigma": 0.1, "min_stride": 0.05},
     )
-
-    # ─── 与 amp_share 一致的对称性奖励 ───
-    # FFT 关节对称：左右关节运动在频域上对称，促进自然步态（与 amp_share 权重一致）
     fft_dof_symmetry = RewTerm(
         func=mdp.fft_dof_symmetry,
-        weight=0.001,
+        weight=SYMMETRY_PRESET.fft_dof_symmetry_weight,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "joint_names_pairs": [
@@ -542,8 +606,8 @@ class RobanLiteRewardCfg(LiteRewardCfg):
         weight=-6e-6,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
-    action_smoothness_l2 = RewTerm(func=mdp.action_smoothness_l2, weight=-0.01)
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.02)
+    action_smoothness_l2 = RewTerm(func=mdp.action_smoothness_l2, weight=-0.02)
 
     # 转弯步频：防止转弯时长时间双脚同时着地（步频太慢）
     turning_step_frequency = RewTerm(
@@ -926,9 +990,10 @@ class RobanWalkFlatEnvCfg:
         ),
     )
     robot: RobotCfg = RobotCfg(
-        actor_obs_history_length=10,
+        actor_obs_history_length=1,  # 1 帧 72 维，与 amp_share 观测端一致
         critic_obs_history_length=10,
         action_scale=0.5, # 也许可以尝试使用公式计算并替代
+        include_gait_in_obs=False,  # 72 维单帧，与部署/amp_share 一致
         # 与 amp_roban_share 一致：仅躯干碰地硬终止，膝盖/手臂碰撞用 undesired_contacts 软惩罚
         terminate_contacts_body_names=["base_link"],
         feet_body_names=["leg_l6_link", "leg_r6_link"],
@@ -1116,7 +1181,7 @@ class RobanWalkAgentCfg(RslRlOnPolicyRunnerCfg):
             use_data_augmentation=True,
             use_mirror_loss=True,
             data_augmentation_func="legged_lab.mdp.symmetry:roban_symmetry_augmentation",
-            mirror_loss_coeff=3.0,
+            mirror_loss_coeff=SYMMETRY_PRESET.mirror_loss_coeff,
         ),
         rnd_cfg=None,  # RslRlRndCfg()
     )
@@ -1152,10 +1217,7 @@ class RobanWalkAgentCfg(RslRlOnPolicyRunnerCfg):
     # 最终奖励 = 1.0 * task_reward + 0.02 * (discriminator_reward_scale * style_reward)
     # AMP 贡献最大 = 0.02 * 2.0 = 0.04（当 style_reward = 1.0 时）
 
-    # ===== 对称性额外参数 (传递给 AMPPPO via runner) =====
-    # Critic 对称性损失系数：V(obs) ≈ V(mirror(obs))
-    critic_mirror_loss_coeff: float = 3
-    # Discriminator 对称性损失模式：0=关闭, 1=仅 policy, 2=仅 expert, 3=两者都用
+    # ===== 对称性额外参数（来自 SYMMETRY_PRESET，传 AMPPPO）=====
+    critic_mirror_loss_coeff: float = SYMMETRY_PRESET.critic_mirror_loss_coeff
     disc_sym_loss_mode: int = 3
-    # Discriminator 对称性损失系数
-    disc_mirror_loss_coeff: float = 3
+    disc_mirror_loss_coeff: float = SYMMETRY_PRESET.disc_mirror_loss_coeff

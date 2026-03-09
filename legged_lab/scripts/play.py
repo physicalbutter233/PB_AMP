@@ -34,6 +34,11 @@ parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
+parser.add_argument(
+    "--export_full_obs",
+    action="store_true",
+    help="Export ONNX with full observation (10 frames, 720 dim). Deploy with frameStack=10 to align with PB_AMP training.",
+)
 
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -77,9 +82,9 @@ def play():
     env_cfg.scene.num_envs = 50
     env_cfg.scene.env_spacing = 2.5
     env_cfg.commands.rel_standing_envs = 0.0
-    env_cfg.commands.ranges.lin_vel_x = (0.6, -0.6)
+    env_cfg.commands.ranges.lin_vel_x = (0.6, 0.6)
     env_cfg.commands.ranges.lin_vel_y = (0.0, 0.0)
-    env_cfg.commands.ranges.ang_vel_z = (0.6, 0.6)  # 禁止旋转，只向前走
+    env_cfg.commands.ranges.ang_vel_z = (0.0, 0.0)  # 禁止旋转，只向前走
     # 禁用速度课程：否则 _apply_velocity_level(0) 会覆盖上面的 ranges
     if hasattr(env_cfg, "velocity_curriculum") and env_cfg.velocity_curriculum is not None:
         env_cfg.velocity_curriculum.enable = False
@@ -113,107 +118,104 @@ def play():
     else:
         runner.load(resume_path, load_optimizer=False)
 
-    # 导出模型：创建适配层将单帧观察值转换为训练格式
+    # 导出模型
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    
-    # 获取当前环境的观察空间维度
     test_obs, _ = env.get_observations()
     actual_obs_dim = test_obs.shape[1]
     history_length = env.cfg.robot.actor_obs_history_length
     single_frame_dim = actual_obs_dim // history_length
-    
-    # 检查是否包含步态信息
+
     include_gait = getattr(env.cfg.robot, 'include_gait_in_obs', True)
-    base_obs_dim = 3 + 3 + 3 + env.num_actions + env.num_actions + env.num_actions  # ang_vel + gravity + command + joint_pos + joint_vel + action
-    gait_dim = 6 if include_gait else 0  # sin(2) + cos(2) + phase_ratio(2)
+    base_obs_dim = 3 + 3 + 3 + env.num_actions + env.num_actions + env.num_actions
+    gait_dim = 6 if include_gait else 0
     expected_single_frame_dim = base_obs_dim + gait_dim
-    
+
     print(f"[INFO] Current observation space:")
     print(f"  - Total obs dimension: {actual_obs_dim}")
     print(f"  - History length: {history_length}")
     print(f"  - Single frame dimension: {single_frame_dim}")
-    print(f"  - Expected single frame dimension: {expected_single_frame_dim}")
     print(f"  - Includes gait: {include_gait}")
-    print(f"  - Number of actions: {env.num_actions}")
-    
-    # 创建适配层：将单帧观察值转换为训练时的格式（10帧历史）
-    class ObsAdapterActor(torch.nn.Module):
-        """适配层Actor：将单帧观察值转换为训练时的格式"""
-        def __init__(self, original_actor, obs_normalizer=None, single_frame_dim=None, history_length=None):
+    print(f"  - Export full obs (10 frames): {getattr(args_cli, 'export_full_obs', False)}")
+
+    export_full_obs = getattr(args_cli, "export_full_obs", False)
+
+    # 导出器要求 policy 有 .is_recurrent 和 .actor，用薄包装满足接口
+    class RawPolicyWrapper(torch.nn.Module):
+        is_recurrent = False
+        def __init__(self, actor):
             super().__init__()
-            self.original_actor = original_actor
-            self.obs_normalizer = obs_normalizer
-            self.single_frame_dim = single_frame_dim
-            self.history_length = history_length
-            
-            # 为了兼容ONNX导出函数，需要让这个模块看起来像Sequential
-            # 创建一个假的Linear层（输入维度，输出维度，实际上不会被使用）
-            self._dummy_layer = torch.nn.Linear(single_frame_dim, single_frame_dim)
-            
-        def __getitem__(self, idx):
-            """模拟Sequential的行为，用于ONNX导出"""
-            if idx == 0:
-                return self._dummy_layer
-            raise IndexError(f"Index {idx} out of range")
-            
-        def forward(self, obs_single_frame):
-            """
-            Args:
-                obs_single_frame: [batch_size, single_frame_dim] - 单帧观察值
-            Returns:
-                actions: [batch_size, num_actions] - 动作
-            """
-            batch_size = obs_single_frame.shape[0]
-            
-            # 单帧 -> 多帧历史（重复当前帧history_length次）
-            obs_history = obs_single_frame.unsqueeze(1).repeat(1, self.history_length, 1)  # [batch, history_length, single_frame_dim]
-            obs_history = obs_history.reshape(batch_size, -1)  # [batch, history_length * single_frame_dim]
-            
-            # 归一化（如果启用）
-            if self.obs_normalizer is not None:
-                obs_history = self.obs_normalizer(obs_history)
-            
-            # 直接通过actor模块
-            return self.original_actor(obs_history)
-    
-    class ObsAdapter(torch.nn.Module):
-        """适配层：包装ObsAdapterActor以符合导出函数的接口"""
-        is_recurrent = False  # 导出函数需要的属性
-        
-        def __init__(self, original_policy, obs_normalizer=None, single_frame_dim=None, history_length=None):
-            super().__init__()
-            # 创建独立的actor模块，避免循环引用
-            self.actor = ObsAdapterActor(original_policy, obs_normalizer, single_frame_dim, history_length)
-            
-        def forward(self, obs_single_frame):
-            """转发到actor模块"""
-            return self.actor(obs_single_frame)
-    
-    # 创建适配后的策略
-    adapted_policy = ObsAdapter(
-        runner.alg.policy.actor, 
-        runner.obs_normalizer if runner.cfg.get("empirical_normalization", False) else None,
-        single_frame_dim=single_frame_dim,
-        history_length=history_length
-    )
-    adapted_policy.eval()
-    
-    # 创建测试输入
-    test_obs_single = torch.zeros(1, single_frame_dim, device=agent_cfg.device)
-    with torch.inference_mode():
-        test_action = adapted_policy(test_obs_single)
-    print(f"[INFO] Export observation dimension: {single_frame_dim} (single-frame)")
-    print(f"[INFO] Test export policy: input {test_obs_single.shape} -> output {test_action.shape}")
-    
-    # 导出适配后的模型
-    export_policy_as_jit(adapted_policy, None, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(
-        adapted_policy, normalizer=None, path=export_model_dir, filename="policy.onnx"
-    )
-    print(f"[INFO] Model exported successfully to {export_model_dir}")
-    
-    # 继续使用运行环境进行play
-    policy = runner.get_inference_policy(device=env.device)
+            self.actor = actor
+        def forward(self, x):
+            return self.actor(x)
+
+    if export_full_obs:
+        # 10 帧 720 维，部署端 frameStack=10
+        policy_to_export = RawPolicyWrapper(runner.alg.policy.actor)
+        policy_to_export.eval()
+        test_input = torch.zeros(1, actual_obs_dim, device=agent_cfg.device)
+        with torch.inference_mode():
+            _ = policy_to_export(test_input)
+        export_policy_as_jit(policy_to_export, None, path=export_model_dir, filename="policy.pt")
+        export_policy_as_onnx(policy_to_export, normalizer=None, path=export_model_dir, filename="policy.onnx")
+        print(f"[INFO] Exported full-obs policy: input {actual_obs_dim} (10 frames). Deploy with frameStack=10, numSingleObs={single_frame_dim}")
+        policy = runner.get_inference_policy(device=env.device)
+    elif history_length == 1:
+        # 训练已是 1 帧 72 维（与 amp_share 一致），直接导出 policy，无需 ObsAdapter
+        policy_to_export = RawPolicyWrapper(runner.alg.policy.actor)
+        policy_to_export.eval()
+        test_input = torch.zeros(1, actual_obs_dim, device=agent_cfg.device)
+        with torch.inference_mode():
+            _ = policy_to_export(test_input)
+        export_policy_as_jit(policy_to_export, None, path=export_model_dir, filename="policy.pt")
+        export_policy_as_onnx(policy_to_export, normalizer=None, path=export_model_dir, filename="policy.onnx")
+        print(f"[INFO] Exported 1-frame policy: input {actual_obs_dim}. Deploy with frameStack=1 (align with amp_share)")
+        policy = runner.get_inference_policy(device=env.device)
+    else:
+        # 训练为多帧，导出单帧 + ObsAdapter（部署 frameStack=1）
+        class ObsAdapterActor(torch.nn.Module):
+            def __init__(self, original_actor, obs_normalizer=None, single_frame_dim=None, history_length=None):
+                super().__init__()
+                self.original_actor = original_actor
+                self.obs_normalizer = obs_normalizer
+                self.single_frame_dim = single_frame_dim
+                self.history_length = history_length
+                self._dummy_layer = torch.nn.Linear(single_frame_dim, single_frame_dim)
+
+            def __getitem__(self, idx):
+                if idx == 0:
+                    return self._dummy_layer
+                raise IndexError(f"Index {idx} out of range")
+
+            def forward(self, obs_single_frame):
+                batch_size = obs_single_frame.shape[0]
+                obs_history = obs_single_frame.unsqueeze(1).repeat(1, self.history_length, 1)
+                obs_history = obs_history.reshape(batch_size, -1)
+                if self.obs_normalizer is not None:
+                    obs_history = self.obs_normalizer(obs_history)
+                return self.original_actor(obs_history)
+
+        class ObsAdapter(torch.nn.Module):
+            is_recurrent = False
+            def __init__(self, original_policy, obs_normalizer=None, single_frame_dim=None, history_length=None):
+                super().__init__()
+                self.actor = ObsAdapterActor(original_policy, obs_normalizer, single_frame_dim, history_length)
+            def forward(self, obs_single_frame):
+                return self.actor(obs_single_frame)
+
+        adapted_policy = ObsAdapter(
+            runner.alg.policy.actor,
+            runner.obs_normalizer if runner.cfg.get("empirical_normalization", False) else None,
+            single_frame_dim=single_frame_dim,
+            history_length=history_length,
+        )
+        adapted_policy.eval()
+        test_obs_single = torch.zeros(1, single_frame_dim, device=agent_cfg.device)
+        with torch.inference_mode():
+            _ = adapted_policy(test_obs_single)
+        export_policy_as_jit(adapted_policy, None, path=export_model_dir, filename="policy.pt")
+        export_policy_as_onnx(adapted_policy, normalizer=None, path=export_model_dir, filename="policy.onnx")
+        print(f"[INFO] Exported single-frame policy: input {single_frame_dim}. Deploy with frameStack=1")
+        policy = runner.get_inference_policy(device=env.device)
 
     if not args_cli.headless:
         from legged_lab.utils.keyboard import Keyboard
