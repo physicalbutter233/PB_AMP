@@ -217,8 +217,20 @@ class RobanEnv(VecEnv):
         # 固定的 AMP / 策略关节顺序（21 DoF），仅 A1 模式使用：
         # [waist, leg_l1..6, leg_r1..6, zarm_l1..4, zarm_r1..4]
         # 与 AMP 64 维观测、npz 转换中的顺序保持一致。
+        # find_joints 可能返回 list，需转为 Tensor 再 cat
+        def _to_tensor(x):
+            if isinstance(x, torch.Tensor):
+                return x.to(device=self.device, dtype=torch.long)
+            return torch.tensor(x, device=self.device, dtype=torch.long)
+
         self.policy_joint_ids = torch.cat(
-            [self.waist_ids, self.left_leg_ids, self.right_leg_ids, self.left_arm_ids, self.right_arm_ids],
+            [
+                _to_tensor(self.waist_ids),
+                _to_tensor(self.left_leg_ids),
+                _to_tensor(self.right_leg_ids),
+                _to_tensor(self.left_arm_ids),
+                _to_tensor(self.right_arm_ids),
+            ],
             dim=0,
         )
         # 机器人关节下标 -> 策略关节下标 的映射，用于 A1 时将策略动作从 AMP 顺序映射回机器人内部顺序。
@@ -229,7 +241,8 @@ class RobanEnv(VecEnv):
 
         # 关节顺序模式：A1 = AMP 顺序（与 amp_share 一致），0_A = robot.data 原生顺序（改顺序前兼容）
         joint_order_mode = getattr(self.cfg.robot, "joint_order_mode", "A1")
-        self.use_amp_joint_order = joint_order_mode == "0_A"
+        # 默认为 A1（AMP 顺序）；只有显式配置为 "0_A" 时才使用 URDF 原生顺序
+        self.use_amp_joint_order = joint_order_mode == "A1"
 
         # 启动时打印关节顺序，便于核对与文档
         joint_names = getattr(self.robot.data, "joint_names", None)

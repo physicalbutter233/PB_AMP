@@ -91,7 +91,12 @@ class Discriminator(nn.Module):
         Returns:
             torch.Tensor: Scalar gradient penalty loss.
         """
-        expert_data = torch.cat([expert_state, expert_next_state], dim=-1)
+        # 对 5 帧判别器，expert_state 本身已是多帧窗口（dim == self.input_dim），
+        # 直接作为输入；对 2 帧判别器仍用 [s_t; s_{t+1}] 拼接，保持向后兼容。
+        if expert_state.shape[-1] == self.input_dim:
+            expert_data = expert_state
+        else:
+            expert_data = torch.cat([expert_state, expert_next_state], dim=-1)
         expert_data.requires_grad = True
 
         disc = self.amp_linear(self.trunk(expert_data))

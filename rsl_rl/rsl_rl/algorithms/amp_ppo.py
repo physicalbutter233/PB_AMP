@@ -622,8 +622,9 @@ class AMPPPO:
                 self.rnd_optimizer.step()
 
             if self.amp_normalizer is not None:
-                self.amp_normalizer.update(policy_state.cpu().numpy())
-                self.amp_normalizer.update(expert_state.cpu().numpy())
+                # amp_normalizer 只做统计，不需要梯度信息
+                self.amp_normalizer.update(policy_state.detach().cpu().numpy())
+                self.amp_normalizer.update(expert_state.detach().cpu().numpy())
 
             # Store the losses
             mean_value_loss += value_loss.item()
