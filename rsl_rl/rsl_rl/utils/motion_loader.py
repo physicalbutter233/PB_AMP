@@ -148,13 +148,16 @@ class AMPLoader:
         preload_transitions=False,
         num_preload_transitions=1000000,
         motion_files=None,
+        num_amp_observations=2,
     ):
         """Expert dataset provides AMP observations.
 
         motion_files: list of paths, or dict {path: weight} (same as amp_share).
         Supports .txt/.json (PB_AMP Frames format) and .npz (amp_share format).
         time_between_frames: Amount of time in seconds between transition.
+        num_amp_observations: 2 = (s, s_next) 对，5 = 5 帧窗口（与 amp_share 一致）。
         """
+        self.num_amp_observations = num_amp_observations
         if motion_files is None:
             motion_files = glob.glob("datasets/motion_amp_expert/*")
         if isinstance(motion_files, dict):
@@ -380,12 +383,33 @@ class AMPLoader:
         return torch.cat([blend_joint_q, blend_joints_vel])
 
     def feed_forward_generator(self, num_mini_batch, mini_batch_size):
-        """Generates a batch of AMP transitions."""
+        """Generates a batch of AMP transitions. 2-frame: (s, s_next); 5-frame: (window_5, window_5)."""
+        obs_dim = self.observation_dim
+        n_frames = self.num_amp_observations
         for _ in range(num_mini_batch):
-            if self.preload_transitions:
+            if n_frames == 5:
+                # 5-frame 窗口：从轨迹中采样连续 5 帧，与 amp_share 一致
+                traj_idxs = self.weighted_traj_idx_sample_batch(mini_batch_size)
+                windows = []
+                for traj_idx in traj_idxs:
+                    traj = self.trajectories[traj_idx]
+                    T = traj.shape[0]
+                    if T < n_frames:
+                        # 轨迹过短时用最后一帧填充
+                        pad = n_frames - T
+                        seg = torch.cat([traj, traj[-1:].expand(pad, -1)], dim=0)
+                    else:
+                        start = int(np.random.randint(0, T - n_frames + 1))
+                        seg = traj[start : start + n_frames]
+                    w = seg.flatten()
+                    windows.append(w)
+                s = torch.stack(windows, dim=0)
+                yield s, s
+            elif self.preload_transitions:
                 idxs = np.random.choice(self.preloaded_s.shape[0], size=mini_batch_size)
                 s = self.preloaded_s[idxs, AMPLoader.JOINT_POSE_START_IDX : AMPLoader.END_POS_END_IDX]
                 s_next = self.preloaded_s_next[idxs, AMPLoader.JOINT_POSE_START_IDX : AMPLoader.END_POS_END_IDX]
+                yield s, s_next
             else:
                 s, s_next = [], []
                 traj_idxs = self.weighted_traj_idx_sample_batch(mini_batch_size)
@@ -396,7 +420,7 @@ class AMPLoader:
 
                 s = torch.vstack(s)
                 s_next = torch.vstack(s_next)
-            yield s, s_next
+                yield s, s_next
 
     @property
     def observation_dim(self):

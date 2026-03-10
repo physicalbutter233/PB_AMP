@@ -67,6 +67,8 @@ class AMPPPO:
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        # AMP 判别器输入帧数：2=(s,s_next)，5=5 帧窗口（与 amp_share 一致）
+        num_amp_observations: int = 2,
     ):
         # device-related parameters
         self.device = device
@@ -116,8 +118,14 @@ class AMPPPO:
         self.min_std = min_std
         self.discriminator = discriminator
         self.discriminator.to(self.device)
+        self.num_amp_observations = num_amp_observations
+        amp_buffer_obs_dim = (
+            discriminator.input_dim
+            if self.num_amp_observations > 2
+            else discriminator.input_dim // 2
+        )
         self.amp_transition = RolloutStorage.Transition()
-        self.amp_storage = ReplayBuffer(discriminator.input_dim // 2, amp_replay_buffer_size, device)
+        self.amp_storage = ReplayBuffer(amp_buffer_obs_dim, amp_replay_buffer_size, device)
         self.amp_data = amp_data
         self.amp_normalizer = amp_normalizer
         
@@ -168,7 +176,11 @@ class AMPPPO:
         # amp_share: store amp_states in rollout for batch style reward in compute_returns
         amp_obs_shape = None
         if self.use_amp_reward_combination and hasattr(self.discriminator, "input_dim"):
-            amp_obs_shape = [self.discriminator.input_dim // 2]
+            amp_obs_shape = (
+                [self.discriminator.input_dim]
+                if self.num_amp_observations > 2
+                else [self.discriminator.input_dim // 2]
+            )
         self.storage = RolloutStorage(
             training_type,
             num_envs,
@@ -513,12 +525,17 @@ class AMPPPO:
                     policy_next_state = self.amp_normalizer.normalize_torch(policy_next_state, self.device)
                     expert_state = self.amp_normalizer.normalize_torch(expert_state, self.device)
                     expert_next_state = self.amp_normalizer.normalize_torch(expert_next_state, self.device)
-            policy_d = self.discriminator(torch.cat([policy_state, policy_next_state], dim=-1))
-            expert_d = self.discriminator(torch.cat([expert_state, expert_next_state], dim=-1))
+            if self.num_amp_observations > 2:
+                # 5-frame: 单窗口输入
+                policy_d = self.discriminator(policy_state)
+                expert_d = self.discriminator(expert_state)
+            else:
+                policy_d = self.discriminator(torch.cat([policy_state, policy_next_state], dim=-1))
+                expert_d = self.discriminator(torch.cat([expert_state, expert_next_state], dim=-1))
             expert_loss = torch.nn.MSELoss()(expert_d, torch.ones(expert_d.size(), device=self.device))
             policy_loss = torch.nn.MSELoss()(policy_d, -1 * torch.ones(policy_d.size(), device=self.device))
             amp_loss = 0.5 * (expert_loss + policy_loss)
-            grad_pen_loss = self.discriminator.compute_grad_pen(*sample_amp_expert, lambda_=10)
+            grad_pen_loss = self.discriminator.compute_grad_pen(expert_state, expert_next_state, lambda_=10)
             loss += self.amploss_coef * amp_loss + self.amploss_coef * grad_pen_loss
 
             # Discriminator symmetry loss: D(amp_obs) ≈ D(mirror(amp_obs))
@@ -533,35 +550,52 @@ class AMPPPO:
 
                 sym_env = self.symmetry["_env"]
                 _disc_sym_loss = torch.tensor(0.0, device=self.device)
-                # Use raw (unnormalized) states from sample_amp_policy/expert
                 raw_policy_state, raw_policy_next_state = sample_amp_policy
                 raw_expert_state, raw_expert_next_state = sample_amp_expert
 
-                if disc_sym_mode in [1, 3]:
-                    # Policy AMP obs symmetry
-                    flip_p_state = _flip_amp_obs_func(raw_policy_state, sym_env)
-                    flip_p_next = _flip_amp_obs_func(raw_policy_next_state, sym_env)
-                    if self.amp_normalizer is not None:
-                        with torch.no_grad():
-                            flip_p_state = self.amp_normalizer.normalize_torch(flip_p_state, self.device)
-                            flip_p_next = self.amp_normalizer.normalize_torch(flip_p_next, self.device)
-                    d_policy_flip = self.discriminator(torch.cat([flip_p_state, flip_p_next], dim=-1))
-                    _disc_sym_loss = _disc_sym_loss + torch.nn.MSELoss()(
-                        d_policy_flip, policy_d.detach()
+                def _flip_5frame(x_5frame):
+                    b, d = x_5frame.shape
+                    n = self.num_amp_observations
+                    single_dim = d // n
+                    out = torch.stack(
+                        [_flip_amp_obs_func(x_5frame[:, i * single_dim : (i + 1) * single_dim], sym_env) for i in range(n)],
+                        dim=1,
                     )
+                    return out.reshape(b, -1)
+
+                if disc_sym_mode in [1, 3]:
+                    if self.num_amp_observations > 2:
+                        flip_p = _flip_5frame(raw_policy_state)
+                        if self.amp_normalizer is not None:
+                            with torch.no_grad():
+                                flip_p = self.amp_normalizer.normalize_torch(flip_p, self.device)
+                        d_policy_flip = self.discriminator(flip_p)
+                    else:
+                        flip_p_state = _flip_amp_obs_func(raw_policy_state, sym_env)
+                        flip_p_next = _flip_amp_obs_func(raw_policy_next_state, sym_env)
+                        if self.amp_normalizer is not None:
+                            with torch.no_grad():
+                                flip_p_state = self.amp_normalizer.normalize_torch(flip_p_state, self.device)
+                                flip_p_next = self.amp_normalizer.normalize_torch(flip_p_next, self.device)
+                        d_policy_flip = self.discriminator(torch.cat([flip_p_state, flip_p_next], dim=-1))
+                    _disc_sym_loss = _disc_sym_loss + torch.nn.MSELoss()(d_policy_flip, policy_d.detach())
 
                 if disc_sym_mode in [2, 3]:
-                    # Expert AMP obs symmetry
-                    flip_e_state = _flip_amp_obs_func(raw_expert_state, sym_env)
-                    flip_e_next = _flip_amp_obs_func(raw_expert_next_state, sym_env)
-                    if self.amp_normalizer is not None:
-                        with torch.no_grad():
-                            flip_e_state = self.amp_normalizer.normalize_torch(flip_e_state, self.device)
-                            flip_e_next = self.amp_normalizer.normalize_torch(flip_e_next, self.device)
-                    d_expert_flip = self.discriminator(torch.cat([flip_e_state, flip_e_next], dim=-1))
-                    _disc_sym_loss = _disc_sym_loss + torch.nn.MSELoss()(
-                        d_expert_flip, expert_d.detach()
-                    )
+                    if self.num_amp_observations > 2:
+                        flip_e = _flip_5frame(raw_expert_state)
+                        if self.amp_normalizer is not None:
+                            with torch.no_grad():
+                                flip_e = self.amp_normalizer.normalize_torch(flip_e, self.device)
+                        d_expert_flip = self.discriminator(flip_e)
+                    else:
+                        flip_e_state = _flip_amp_obs_func(raw_expert_state, sym_env)
+                        flip_e_next = _flip_amp_obs_func(raw_expert_next_state, sym_env)
+                        if self.amp_normalizer is not None:
+                            with torch.no_grad():
+                                flip_e_state = self.amp_normalizer.normalize_torch(flip_e_state, self.device)
+                                flip_e_next = self.amp_normalizer.normalize_torch(flip_e_next, self.device)
+                        d_expert_flip = self.discriminator(torch.cat([flip_e_state, flip_e_next], dim=-1))
+                    _disc_sym_loss = _disc_sym_loss + torch.nn.MSELoss()(d_expert_flip, expert_d.detach())
 
                 disc_symmetry_loss = disc_sym_coeff * _disc_sym_loss
                 loss += disc_symmetry_loss

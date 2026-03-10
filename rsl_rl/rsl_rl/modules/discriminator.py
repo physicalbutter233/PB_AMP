@@ -125,7 +125,11 @@ class Discriminator(nn.Module):
                 state = normalizer.normalize_torch(state, self.device)
                 next_state = normalizer.normalize_torch(next_state, self.device)
 
-            d = self.amp_linear(self.trunk(torch.cat([state, next_state], dim=-1)))
+            if state.shape[-1] == self.input_dim:
+                x = state
+            else:
+                x = torch.cat([state, next_state], dim=-1)
+            d = self.amp_linear(self.trunk(x))
             reward = self.amp_reward_coef * torch.clamp(1 - (1 / 4) * torch.square(d - 1), min=0)
             if self.task_reward_lerp > 0:
                 reward = self._lerp_reward(reward, task_reward.unsqueeze(-1))
@@ -150,27 +154,18 @@ class Discriminator(nn.Module):
         """
         Predict the AMP style reward (without lerp with task reward).
         This matches the behavior of amp_roban_share.
-
-        Args:
-            state (torch.Tensor): Current state tensor.
-            next_state (torch.Tensor): Next state tensor.
-            normalizer (optional): Normalizer object to normalize input states before prediction.
-            reward_scale (float): Scale factor for the reward (equivalent to discriminator_reward_scale).
-
-        Returns:
-            tuple:
-                - reward (torch.Tensor): Predicted AMP style reward with shape (batch_size,).
-                - d (torch.Tensor): Raw discriminator output logits with shape (batch_size, 1).
+        When input_dim is 5-frame (320), state is the 5-frame window; next_state is ignored for the forward pass.
         """
         with torch.no_grad():
             self.eval()
             if normalizer is not None:
                 state = normalizer.normalize_torch(state, self.device)
                 next_state = normalizer.normalize_torch(next_state, self.device)
-
-            d = self.amp_linear(self.trunk(torch.cat([state, next_state], dim=-1)))
-            # Compute style reward: clamp(1 - (1/4) * (d - 1)^2, min=0) * reward_scale
-            # This matches amp_roban_share's MSE discriminator_loss_type
+            if state.shape[-1] == self.input_dim:
+                x = state
+            else:
+                x = torch.cat([state, next_state], dim=-1)
+            d = self.amp_linear(self.trunk(x))
             reward = reward_scale * torch.clamp(1 - (1 / 4) * torch.square(d - 1), min=0)
             self.train()
         return reward.squeeze(), d

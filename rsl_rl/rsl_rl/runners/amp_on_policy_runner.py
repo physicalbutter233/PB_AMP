@@ -116,15 +116,19 @@ class AmpOnPolicyRunner:
                 "disc_mirror_loss_coeff", 0.0
             )
 
-        # init amp loader
+        # init amp loader（2 帧用 preload，5 帧用 on-the-fly 采样）
+        num_amp_observations = train_cfg.get("num_amp_observations", 2)
         amp_data = AMPLoader(
             device,
             time_between_frames=self.env.step_dt,
-            preload_transitions=True,
+            preload_transitions=(num_amp_observations == 2),
             num_preload_transitions=train_cfg["amp_num_preload_transitions"],
             motion_files=train_cfg["amp_motion_files"],
+            num_amp_observations=num_amp_observations,
         )
-        amp_normalizer = Normalizer(amp_data.observation_dim)
+        # 2 帧时按单帧 64 维归一化；5 帧时按整窗 320 维归一化
+        amp_norm_dim = amp_data.observation_dim if num_amp_observations == 2 else amp_data.observation_dim * num_amp_observations
+        amp_normalizer = Normalizer(amp_norm_dim)
         
         # 打印 AMP 配置（确保配置正确加载）
         print("=" * 80)
@@ -141,13 +145,15 @@ class AmpOnPolicyRunner:
         task_reward_lerp = train_cfg.get("amp_task_reward_lerp", 0.0)
         amp_reward_coef = train_cfg.get("amp_reward_coef", 0.3)
         
+        num_amp_observations = train_cfg.get("num_amp_observations", 2)
         discriminator = Discriminator(
-            amp_data.observation_dim * 2,
+            amp_data.observation_dim * num_amp_observations,
             amp_reward_coef,
             train_cfg["amp_discr_hidden_dims"],
             device,
             task_reward_lerp,
         ).to(self.device)
+        print(f"  discriminator input: {num_amp_observations} frames ({amp_data.observation_dim * num_amp_observations} dim)")
         
         # 验证 Discriminator 中的配置
         print(f"[AmpOnPolicyRunner] Discriminator 实际配置:")
@@ -155,6 +161,9 @@ class AmpOnPolicyRunner:
         print(f"  discriminator.task_reward_lerp = {discriminator.task_reward_lerp}")
         print("=" * 80)
         min_std = torch.zeros(len(train_cfg["min_normalized_std"]), device=self.device, requires_grad=False)
+
+        # 传入 num_amp_observations 供 AMPPPO 区分 2 帧 / 5 帧判别器
+        self.alg_cfg["num_amp_observations"] = num_amp_observations
 
         # initialize algorithm
         alg_class = eval(self.alg_cfg.pop("class_name"))
@@ -289,6 +298,13 @@ class AmpOnPolicyRunner:
             # TODO: Do we need to synchronize empirical normalizers?
             #   Right now: No, because they all should converge to the same values "asymptotically".
 
+        # 5-frame 判别器：维护 (num_envs, 5, 64) buffer，每步形成 5-frame 窗口
+        num_amp_observations = getattr(self.alg, "num_amp_observations", 2)
+        if num_amp_observations == 5:
+            amp_obs_buffer = amp_obs.unsqueeze(1).expand(-1, 5, -1).clone()
+        else:
+            amp_obs_buffer = None
+
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
@@ -297,8 +313,12 @@ class AmpOnPolicyRunner:
             # Rollout
             with torch.inference_mode():
                 for _ in range(self.num_steps_per_env):
+                    if num_amp_observations == 5:
+                        amp_input = amp_obs_buffer.reshape(amp_obs_buffer.shape[0], -1)
+                    else:
+                        amp_input = amp_obs
                     # Sample actions
-                    actions = self.alg.act(obs, privileged_obs, amp_obs)
+                    actions = self.alg.act(obs, privileged_obs, amp_input)
                     # Step the environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
                     next_amp_obs = self.env.get_amp_obs_for_expert_trans()
@@ -322,7 +342,17 @@ class AmpOnPolicyRunner:
                     next_amp_obs_with_term = torch.clone(next_amp_obs)
                     reset_env_ids = self.env.reset_env_ids
                     terminal_amp_states = self.env.get_amp_obs_for_expert_trans()[reset_env_ids]
+                    terminal_amp_states = terminal_amp_states.to(self.device)
                     next_amp_obs_with_term[reset_env_ids] = terminal_amp_states
+
+                    if num_amp_observations == 5:
+                        # 滚动 5-frame buffer，并处理 reset
+                        amp_obs_buffer[:, 0:4] = amp_obs_buffer[:, 1:5].clone()
+                        amp_obs_buffer[:, 4] = next_amp_obs_with_term
+                        amp_obs_buffer[reset_env_ids] = terminal_amp_states.unsqueeze(1).expand(-1, 5, -1)
+                        next_amp_for_storage = amp_obs_buffer.reshape(amp_obs_buffer.shape[0], -1)
+                    else:
+                        next_amp_for_storage = next_amp_obs_with_term
 
                     # amp_share: rollout only stores task rewards and amp_obs; style reward in batch at compute_returns
                     if self.alg.use_amp_reward_combination:
@@ -331,13 +361,13 @@ class AmpOnPolicyRunner:
                         amp_rewards = None
                     else:
                         rewards = self.alg.discriminator.predict_amp_reward(
-                            amp_obs, next_amp_obs_with_term, rewards, normalizer=self.alg.amp_normalizer
+                            amp_input, next_amp_for_storage, rewards, normalizer=self.alg.amp_normalizer
                         )[0]
                         task_rewards = None
                         amp_rewards = None
 
                     amp_obs = torch.clone(next_amp_obs)
-                    self.alg.process_env_step(rewards, dones, infos, next_amp_obs_with_term, task_rewards, amp_rewards)
+                    self.alg.process_env_step(rewards, dones, infos, next_amp_for_storage, task_rewards, amp_rewards)
 
                     # Extract intrinsic rewards (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None

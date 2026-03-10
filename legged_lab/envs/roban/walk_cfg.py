@@ -156,6 +156,43 @@ SYMMETRY_WEAK = SymmetryPresetCfg(
 SYMMETRY_PRESET = SYMMETRY_WEAK  # 切换为 SYMMETRY_WEAK 即使用弱对称
 
 
+# =============================================================================
+# AMP 网络结构预设：策略/价值/判别器帧数
+# =============================================================================
+
+@configclass
+class AmpArchPresetCfg:
+    """AMP 策略 / 价值 / 判别器输入帧数预设。"""
+
+    name: str = ""
+    # 策略网络：始终单帧（与部署一致）
+    actor_obs_history_length: int = 1
+    # 价值网络：单帧或多帧
+    critic_obs_history_length: int = 10
+    # 判别器输入：2 帧 (s_t, s_{t+1}) 或 5 帧 (amp_share 同款)
+    num_amp_observations: int = 2
+
+
+# 7E 及此前：单帧策略，10 帧价值，2 帧判别器（当前默认）
+AMP_ARCH_7E_AND_FORMER = AmpArchPresetCfg(
+    name="7E_and_former",
+    actor_obs_history_length=1,
+    critic_obs_history_length=10,
+    num_amp_observations=2,
+)
+
+# 8A 及此后：与 amp_share 一致，单帧策略，单帧价值，5 帧判别器
+AMP_ARCH_8A_AND_LATER = AmpArchPresetCfg(
+    name="8A_and_later",
+    actor_obs_history_length=1,
+    critic_obs_history_length=1,
+    num_amp_observations=5,
+)
+
+# 当前使用的 AMP 结构预设（改此处即可切换 7E / 8A）
+AMP_ARCH_PRESET = AMP_ARCH_8A_AND_LATER  # 切换为 AMP_ARCH_8A_AND_LATER 即与 amp_share 一致
+
+
 @configclass
 class TerrainForceCurriculumCfg:
     """与 amp_share 一致：地形课程 + 推力课程，切换条件为外力水平 >= stage_two_force_threshold 时应用 stage_2 权重。"""
@@ -996,8 +1033,8 @@ class RobanWalkFlatEnvCfg:
         ),
     )
     robot: RobotCfg = RobotCfg(
-        actor_obs_history_length=1,  # 1 帧 72 维，与 amp_share 观测端一致
-        critic_obs_history_length=10,
+        actor_obs_history_length=AMP_ARCH_PRESET.actor_obs_history_length,  # 与 AMP_ARCH_PRESET 一致
+        critic_obs_history_length=AMP_ARCH_PRESET.critic_obs_history_length,
         action_scale=0.25,  # 与 amp_share RobanS2_ACTION_SCALE 一致
         include_gait_in_obs=False,  # 72 维单帧，与部署/amp_share 一致
         # 与 amp_roban_share 一致：仅躯干碰地硬终止，膝盖/手臂碰撞用 undesired_contacts 软惩罚
@@ -1210,7 +1247,10 @@ class RobanWalkAgentCfg(RslRlOnPolicyRunnerCfg):
     amp_motion_files = get_amp_motion_files_multi_trajectory()
     amp_num_preload_transitions = 200000
     amp_discr_hidden_dims = [1024, 512, 256]
-    min_normalized_std = [0.05] * 64  # AMP obs dim (amp_share 同款): 21 joint_pos + 21 joint_vel + 1 root_height + 3 root_gravity + 3 root_lin_vel + 3 root_ang_vel + 12 end_effector
+    # 判别器输入帧数：7E_and_former=2 帧 (s, s_next)，8A_and_later=5 帧（与 amp_share 一致）
+    num_amp_observations: int = AMP_ARCH_PRESET.num_amp_observations
+    # AMP：2 帧判别器用 64（按单帧归一化），5 帧判别器用 64*5=320
+    min_normalized_std = [0.05] * (64 if AMP_ARCH_PRESET.num_amp_observations == 2 else 64 * AMP_ARCH_PRESET.num_amp_observations)
     
     # 向后兼容参数（如果使用旧机制）
     amp_reward_coef = 0.3  # 仅用于向后兼容，新机制不使用
