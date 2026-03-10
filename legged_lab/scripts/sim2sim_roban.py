@@ -55,7 +55,7 @@ class SimToSimCfg:
         decimation = 4
         clip_observations = 100.0
         clip_actions = 100.0
-        action_scale = 0.5  # 与 walk_cfg 的 robot.action_scale 对齐
+        action_scale = 0.25  # 与 walk_cfg 的 robot.action_scale 对齐
 
     class robot:
         gait_air_ratio_l: float = 0.38

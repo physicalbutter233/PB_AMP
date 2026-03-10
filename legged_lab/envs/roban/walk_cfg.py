@@ -153,7 +153,7 @@ SYMMETRY_WEAK = SymmetryPresetCfg(
 )
 
 # 当前使用的对称性预设（改此处即可切换强/弱对称）
-SYMMETRY_PRESET = SYMMETRY_STRONG  # 切换为 SYMMETRY_WEAK 即使用弱对称
+SYMMETRY_PRESET = SYMMETRY_WEAK  # 切换为 SYMMETRY_WEAK 即使用弱对称
 
 
 @configclass
@@ -377,10 +377,15 @@ class RobanLiteRewardCfg(LiteRewardCfg):
         weight=1.55,
         params={"std": math.sqrt(0.5)},
     )
-    # 结构性：躯干水平与基高（覆盖 LiteRewardCfg 默认，加大权重）
+    # 结构性：躯干水平与基高（覆盖 LiteRewardCfg 默认，与 amp_share 对齐以减小身体晃动）
     flat_orientation_exp = RewTerm(
         func=mdp.flat_orientation_exp, weight=1.5, params={"std": 0.25}
     )
+    # 与 amp_share 一致：L2 惩罚躯干倾斜，显著抑制 roll/pitch 晃动
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-5.0)
+    # 与 amp_share 一致：惩罚 body 系下垂直线速度与 roll/pitch 角速度，进一步稳躯干
+    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-1.0)
+    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-2.0)
     base_height_penalty = RewTerm(
         func=mdp.base_height_penalty,
         weight=-1.5,
@@ -573,6 +578,7 @@ class RobanLiteRewardCfg(LiteRewardCfg):
             "std": 0.05,
         },
     )
+    # 与 amp_share stage_two 一致：-1.0 从训练开始即生效，强化「初始化即进入站立」能力（不新增 amp_share 没有的项）
     stand_still_without_cmd = RewTerm(
         func=mdp.stand_still_without_cmd,
         weight=-0.3,
@@ -647,7 +653,7 @@ class RobanLiteRewardCfg(LiteRewardCfg):
 
     # ─── REMOVED/DISABLED ───
     # humanoid_flight_penalty（两腿同时腾飞）已删除；单支撑时长惩罚已由 feet_air_time_clip 替代
-    # stand_still_penalty, dof_vel_limits, lin_vel_z_l2, ang_vel_xy_l2, stumble, feet_force
+    # stand_still_penalty, dof_vel_limits, stumble, feet_force（lin_vel_z_l2/ang_vel_xy_l2 已加入上方与 amp_share 对齐）
     # feet_height, straight_knee_landing, soft_landing, root_height_maintain
 
     # ─── 前行指令与奖励门控说明（RobanLiteRewardCfg）───
@@ -992,7 +998,7 @@ class RobanWalkFlatEnvCfg:
     robot: RobotCfg = RobotCfg(
         actor_obs_history_length=1,  # 1 帧 72 维，与 amp_share 观测端一致
         critic_obs_history_length=10,
-        action_scale=0.5, # 也许可以尝试使用公式计算并替代
+        action_scale=0.25,  # 与 amp_share RobanS2_ACTION_SCALE 一致
         include_gait_in_obs=False,  # 72 维单帧，与部署/amp_share 一致
         # 与 amp_roban_share 一致：仅躯干碰地硬终止，膝盖/手臂碰撞用 undesired_contacts 软惩罚
         terminate_contacts_body_names=["base_link"],

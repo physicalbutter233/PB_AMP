@@ -8,6 +8,9 @@
 
 Joint layout: 21 DoF — 1 waist (waist_yaw) + 6×2 legs (leg_l1..6, leg_r1..6) + 4×2 arms (zarm_l1..4, zarm_r1..4).
 与 amp_roban_share RobanS2 一致：使用 URDF 载入（UrdfFileCfg），保证 rigid bodies 与 contact sensors 正确。
+
+PB_AMP 导出的 ONNX 关节顺序以此为准（与 init_state.joint_pos 键顺序一致）：
+  索引 0: waist_yaw_joint; 1-6: leg_l1..l6; 7-12: leg_r1..r6; 13-16: zarm_l1..l4; 17-20: zarm_r1..r4.
 """
 
 import isaaclab.sim as sim_utils
