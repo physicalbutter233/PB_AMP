@@ -214,6 +214,33 @@ class RobanEnv(VecEnv):
             preserve_order=True,
         )
 
+        # 固定的 AMP / 策略关节顺序（21 DoF），仅 A1 模式使用：
+        # [waist, leg_l1..6, leg_r1..6, zarm_l1..4, zarm_r1..4]
+        # 与 AMP 64 维观测、npz 转换中的顺序保持一致。
+        self.policy_joint_ids = torch.cat(
+            [self.waist_ids, self.left_leg_ids, self.right_leg_ids, self.left_arm_ids, self.right_arm_ids],
+            dim=0,
+        )
+        # 机器人关节下标 -> 策略关节下标 的映射，用于 A1 时将策略动作从 AMP 顺序映射回机器人内部顺序。
+        num_robot_joints = self.robot.data.joint_pos.shape[1]
+        self.robot_to_policy = -torch.ones(num_robot_joints, dtype=torch.long, device=self.device)
+        for policy_idx, robot_idx in enumerate(self.policy_joint_ids.tolist()):
+            self.robot_to_policy[robot_idx] = policy_idx
+
+        # 关节顺序模式：A1 = AMP 顺序（与 amp_share 一致），0_A = robot.data 原生顺序（改顺序前兼容）
+        joint_order_mode = getattr(self.cfg.robot, "joint_order_mode", "A1")
+        self.use_amp_joint_order = joint_order_mode == "0_A"
+
+        # 启动时打印关节顺序，便于核对与文档
+        joint_names = getattr(self.robot.data, "joint_names", None)
+        if joint_names is not None:
+            print("[RobanEnv] robot.data.joint_names (URDF/仿真内部顺序):", list(joint_names))
+            if self.use_amp_joint_order:
+                policy_order = [joint_names[i] for i in self.policy_joint_ids.tolist()]
+                print("[RobanEnv] joint_order_mode=A1 (策略/AMP 顺序):", policy_order)
+            else:
+                print("[RobanEnv] joint_order_mode=0_A (策略使用 robot.data 原生顺序，与上述 joint_names 一致)")
+
         self.obs_scales = self.cfg.normalization.obs_scales
         self.add_noise = self.cfg.noise.add_noise
 
@@ -436,8 +463,18 @@ class RobanEnv(VecEnv):
         ang_vel = robot.data.root_ang_vel_b
         projected_gravity = robot.data.projected_gravity_b
         command = self.command_generator.command
-        joint_pos = robot.data.joint_pos - robot.data.default_joint_pos
-        joint_vel = robot.data.joint_vel - robot.data.default_joint_vel
+        if self.use_amp_joint_order:
+            # A1: 关节观测按 AMP 顺序重排，与 AMP 64 维中的 21 维一致。
+            joint_pos_raw = robot.data.joint_pos[:, self.policy_joint_ids]
+            joint_vel_raw = robot.data.joint_vel[:, self.policy_joint_ids]
+            default_joint_pos = robot.data.default_joint_pos[:, self.policy_joint_ids]
+            default_joint_vel = robot.data.default_joint_vel[:, self.policy_joint_ids]
+            joint_pos = joint_pos_raw - default_joint_pos
+            joint_vel = joint_vel_raw - default_joint_vel
+        else:
+            # 0_A: 使用 robot.data 原生顺序（改顺序前兼容）。
+            joint_pos = robot.data.joint_pos - robot.data.default_joint_pos
+            joint_vel = robot.data.joint_vel - robot.data.default_joint_vel
         action = self.action_buffer._circular_buffer.buffer[:, -1, :]
         root_lin_vel = robot.data.root_lin_vel_b
         feet_contact = (torch.max(torch.norm(net_contact_forces[:, :, self.feet_cfg.body_ids], dim=-1), dim=1)[0] > 0.5).float()
@@ -536,7 +573,15 @@ class RobanEnv(VecEnv):
         delayed_actions = self.action_buffer.compute(actions)
         self.action = torch.clip(delayed_actions, -self.clip_actions, self.clip_actions).to(self.device)
 
-        processed_actions = self.action * self.action_scale + self.robot.data.default_joint_pos
+        if self.use_amp_joint_order:
+            # A1: 策略输出为 AMP 顺序，映射回机器人内部顺序后写入仿真。
+            delta_policy = self.action * self.action_scale
+            delta_robot = torch.zeros_like(self.robot.data.default_joint_pos)
+            delta_robot[:, self.policy_joint_ids] = delta_policy
+            processed_actions = self.robot.data.default_joint_pos + delta_robot
+        else:
+            # 0_A: 策略输出即 robot.data 顺序，直接加 default 写入仿真。
+            processed_actions = self.robot.data.default_joint_pos + self.action * self.action_scale
 
         self.avg_feet_force_per_step = torch.zeros(
             self.num_envs, len(self.feet_cfg.body_ids), dtype=torch.float, device=self.device, requires_grad=False

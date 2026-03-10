@@ -32,11 +32,12 @@ from legged_lab.envs.tienkung.walk_with_sensor_cfg import (
     TienKungWalkWithSensorAgentCfg,
     TienKungWalkWithSensorFlatEnvCfg,
 )
-from legged_lab.envs.roban import RobanEnv, RobanWalkAgentCfg, RobanWalkFlatEnvCfg
+from legged_lab.envs.roban import RobanEnv, RobanWalkAgentCfg, RobanWalkFlatEnvCfg, RobanWalkFlatEnvCfg_0A
 from legged_lab.utils.task_registry import task_registry
 
 task_registry.register("walk", TienKungEnv, TienKungWalkFlatEnvCfg(), TienKungWalkAgentCfg())
 task_registry.register("roban_walk", RobanEnv, RobanWalkFlatEnvCfg(), RobanWalkAgentCfg())
+task_registry.register("roban_walk_0A", RobanEnv, RobanWalkFlatEnvCfg_0A(), RobanWalkAgentCfg())
 task_registry.register("run", TienKungEnv, TienKungRunFlatEnvCfg(), TienKungRunAgentCfg())
 task_registry.register(
     "walk_with_sensor", TienKungEnv, TienKungWalkWithSensorFlatEnvCfg(), TienKungWalkWithSensorAgentCfg()

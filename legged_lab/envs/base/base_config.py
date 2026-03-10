@@ -68,6 +68,10 @@ class RobotCfg:
     feet_body_names: list = []
     include_gait_in_obs: bool = False  # 是否在观察值中包含步态信息；False=72维与部署/amp_share一致
     terminate_min_height: float = 0.0  # 根部高度低于此值时终止（0 表示不启用）
+    # 关节顺序模式（仅 Roban 等有 21 DoF 且需与 AMP 对齐时使用）：
+    # "A1" = AMP 顺序 [waist, leg_l1..6, leg_r1..6, zarm_l1..4, zarm_r1..4]，与 amp_share 一致；
+    # "0_A" = robot.data 原生顺序（URDF 解析顺序），与改顺序前的训练/play 兼容。
+    joint_order_mode: str = "A1"
 
 
 @configclass

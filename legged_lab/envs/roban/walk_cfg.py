@@ -1042,6 +1042,7 @@ class RobanWalkFlatEnvCfg:
         feet_body_names=["leg_l6_link", "leg_r6_link"],
         # 与 amp_roban_share 一致：根部高度低于 0.35m 时终止（真正摔倒）
         terminate_min_height=0.35,
+        joint_order_mode="A1",  # AMP 顺序，与 amp_share 一致
     )
     # 使用原本的奖励函数配置（RobanLiteRewardCfg），而非与 amp_share 一致的 RobanAmpShareRewardCfg
     reward = RobanLiteRewardCfg()
@@ -1188,6 +1189,18 @@ class RobanWalkFlatEnvCfg:
         decimation=4,
         physx=PhysxCfg(gpu_max_rigid_patch_count=10 * 2**15, gpu_collision_stack_size=2**27),
     )
+
+
+@configclass
+class RobanWalkFlatEnvCfg_0A(RobanWalkFlatEnvCfg):
+    """Legacy: 关节顺序 0_A（robot.data 原生顺序，URDF 解析顺序），用于运行改顺序前的 checkpoint / play。"""
+
+    def __post_init__(self):
+        try:
+            super().__post_init__()
+        except AttributeError:
+            pass
+        self.robot.joint_order_mode = "0_A"
 
 
 @configclass
